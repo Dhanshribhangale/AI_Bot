@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Voice Bot</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <div class="header-content">
+                <img src="/static/bot-icon.png" alt="Bot Icon" class="bot-icon">
+                <h1>AI Voice Bot</h1>
+            </div>
+            <div class="voice-controls">
+                <select id="voice-select">
+                    <option value="Kore" selected>Kore</option>
+                    <option value="Nova">Nova</option>
+                    <option value="Fable">Fable</option>
+                    <option value="Echo">Echo</option>
+                </select>
+                <button id="toggle-voice-btn" class="voice-btn">
+                    🔊 Text to Voice
+                </button>
+            </div>
+        </div>
+        <div class="chat-messages" id="chat-messages">
+            </div>
+        <div class="chat-input">
+            <input type="text" id="user-input" placeholder="Type your message...">
+            <button id="send-btn" class="send-btn">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M2.01 21L23 12 2.01 3v8.99L17 12l-14.99 1V21z"/>
+                </svg>
+            </button>
+        </div>
+        <div class="status-bar" id="status-bar">
+            Connecting...
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
