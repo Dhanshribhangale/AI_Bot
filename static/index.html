@@ -28,12 +28,18 @@
         <div class="chat-messages" id="chat-messages">
             </div>
         <div class="chat-input">
-            <input type="text" id="user-input" placeholder="Type your message...">
-            <button id="send-btn" class="send-btn">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M2.01 21L23 12 2.01 3v8.99L17 12l-14.99 1V21z"/>
-                </svg>
-            </button>
+            <div class="input-container">
+                <input type="text" id="user-input" placeholder="Type your message or use voice...">
+                <button id="voice-input-btn" class="voice-input-btn" title="Click to speak">
+                    🎤
+                </button>
+                <button id="send-btn" class="send-btn">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M2.01 21L23 12 2.01 3v8.99L17 12l-14.99 1V21z"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="voice-status" id="voice-status"></div>
         </div>
         <div class="status-bar" id="status-bar">
             Connecting...

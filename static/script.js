@@ -4,6 +4,8 @@ const sendBtn = document.getElementById('send-btn');
 const statusDiv = document.getElementById('status-bar');
 const voiceBtn = document.getElementById('toggle-voice-btn');
 const voiceSelect = document.getElementById('voice-select');
+const voiceInputBtn = document.getElementById('voice-input-btn');
+const voiceStatus = document.getElementById('voice-status');
 
 let ws;
 let isVoiceEnabled = false;
@@ -11,9 +13,144 @@ let sessionId = null;
 const audioQueue = [];
 let isPlaying = false;
 
+// Speech Recognition setup
+let recognition = null;
+let isRecording = false;
+
+// Initialize speech recognition if available
+function initSpeechRecognition() {
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        recognition = new SpeechRecognition();
+        
+        recognition.continuous = false;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US';
+        
+        recognition.onstart = () => {
+            isRecording = true;
+            voiceInputBtn.classList.add('recording');
+            voiceInputBtn.textContent = '⏹️';
+            voiceStatus.textContent = 'Listening...';
+            voiceStatus.className = 'voice-status recording';
+            statusDiv.textContent = 'Voice input active...';
+        };
+        
+        recognition.onresult = (event) => {
+            let finalTranscript = '';
+            let interimTranscript = '';
+            
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                const transcript = event.results[i][0].transcript;
+                if (event.results[i].isFinal) {
+                    finalTranscript += transcript;
+                } else {
+                    interimTranscript += transcript;
+                }
+            }
+            
+            // Show interim results
+            if (interimTranscript) {
+                userInput.value = interimTranscript;
+            }
+            
+            // Process final result
+            if (finalTranscript) {
+                userInput.value = finalTranscript;
+                voiceStatus.textContent = 'Processing voice input...';
+                voiceStatus.className = 'voice-status success';
+                
+                // Automatically send the voice input
+                setTimeout(() => {
+                    sendVoiceMessage(finalTranscript);
+                }, 500);
+            }
+        };
+        
+        recognition.onerror = (event) => {
+            console.error('Speech recognition error:', event.error);
+            isRecording = false;
+            voiceInputBtn.classList.remove('recording');
+            voiceInputBtn.textContent = '🎤';
+            voiceStatus.textContent = `Error: ${event.error}`;
+            voiceStatus.className = 'voice-status error';
+            statusDiv.textContent = 'Voice input error. Please try again.';
+        };
+        
+        recognition.onend = () => {
+            isRecording = false;
+            voiceInputBtn.classList.remove('recording');
+            voiceInputBtn.textContent = '🎤';
+            if (voiceStatus.textContent === 'Listening...') {
+                voiceStatus.textContent = 'Voice input ended';
+                voiceStatus.className = 'voice-status';
+            }
+            statusDiv.textContent = 'Ready to chat.';
+        };
+        
+        console.log('Speech recognition initialized');
+    } else {
+        console.warn('Speech recognition not supported in this browser');
+        voiceInputBtn.style.display = 'none';
+        voiceStatus.textContent = 'Voice input not supported in this browser';
+        voiceStatus.className = 'voice-status error';
+    }
+}
+
 // Add event listeners for voice functionality
 voiceBtn.addEventListener('click', toggleVoice);
 voiceSelect.addEventListener('change', onVoiceChange);
+voiceInputBtn.addEventListener('click', toggleVoiceInput);
+
+// Voice input toggle function
+function toggleVoiceInput() {
+    if (!recognition) {
+        voiceStatus.textContent = 'Speech recognition not available';
+        voiceStatus.className = 'voice-status error';
+        return;
+    }
+    
+    if (isRecording) {
+        recognition.stop();
+    } else {
+        try {
+            recognition.start();
+        } catch (error) {
+            console.error('Error starting speech recognition:', error);
+            voiceStatus.textContent = 'Error starting voice input';
+            voiceStatus.className = 'voice-status error';
+        }
+    }
+}
+
+// Function to send voice message
+function sendVoiceMessage(transcript) {
+    if (!transcript.trim()) return;
+    
+    // Display user message
+    addMessage('user', transcript);
+    statusDiv.textContent = 'Processing voice input...';
+    
+    // Send message to server
+    if (ws.readyState === WebSocket.OPEN) {
+        const payload = {
+            type: 'voice_message',
+            message: transcript,
+            client_agent: navigator.userAgent
+        };
+        ws.send(JSON.stringify(payload));
+        userInput.value = '';
+        
+        // Automatically enable voice output for voice input
+        if (!isVoiceEnabled) {
+            isVoiceEnabled = true;
+            voiceBtn.textContent = '🔇 Disable Voice';
+            voiceBtn.classList.add('active');
+        }
+    } else {
+        addMessage('system', 'Connection not open. Please wait.');
+    }
+}
 
 function connectWebSocket() {
     ws = new WebSocket(`ws://${location.hostname}:8765`);
@@ -45,6 +182,16 @@ function connectWebSocket() {
                 const audioUrl = URL.createObjectURL(audioBlob);
                 await playAudio(audioUrl);
             }
+        } else if (data.type === 'voice_message_response') {
+            // Handle response to voice input - automatically enable voice output
+            addMessage('assistant', data.message);
+            isVoiceEnabled = true;
+            voiceBtn.textContent = '🔇 Disable Voice';
+            voiceBtn.classList.add('active');
+            
+            // Always generate voice for voice input responses
+            requestVoice(data.message);
+            statusDiv.textContent = 'Ready to chat.';
         } else if (data.type === 'error') {
             addMessage('system', `Error: ${data.message}`);
             statusDiv.textContent = 'An error occurred.';
@@ -220,3 +367,4 @@ userInput.addEventListener('keypress', (e) => {
 
 // Initialize
 connectWebSocket();
+initSpeechRecognition(); // Initialize speech recognition

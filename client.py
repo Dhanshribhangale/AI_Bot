@@ -60,6 +60,8 @@ class ChatbotWebSocketServer:
                 await self.handle_chat_message(websocket, data, client_id)
             elif message_type == 'voice_request':
                 await self.handle_voice_request(websocket, data, client_id)
+            elif message_type == 'voice_message':
+                await self.handle_voice_message(websocket, data, client_id)
             else:
                 logger.warning(f"Unknown message type: {message_type}")
         except json.JSONDecodeError:
@@ -129,6 +131,71 @@ class ChatbotWebSocketServer:
                 'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 'message_length': len(text),
                 'voice_generated': False, 'voice_voice_name': voice_name, 'error_message': str(e),
                 'client_agent': data.get('client_agent', 'unknown'), 'processing_status': 'error'
+            })
+    
+    async def handle_voice_message(self, websocket: WebSocketServerProtocol, data: dict, client_id: str):
+        try:
+            user_message = data.get('message', '').strip()
+            if not user_message:
+                await websocket.send(json.dumps({"type": "error", "message": "No message provided", "timestamp": datetime.now().isoformat()}))
+                return
+            
+            # Generate AI response to the voice input
+            start_time = time.time()
+            conversation_history = self.conversation_history.get(client_id, [])
+            ai_response = await self.ai_client.generate_response(user_message, conversation_history)
+            response_time = (time.time() - start_time) * 1000
+            
+            # Update conversation history
+            conversation_entry = {'user': user_message, 'assistant': ai_response, 'timestamp': datetime.now().isoformat()}
+            conversation_history.append(conversation_entry)
+            self.conversation_history[client_id] = conversation_history
+            
+            # Send the AI response as a voice message response
+            response_message = {
+                "type": "voice_message_response", 
+                "message": ai_response, 
+                "timestamp": datetime.now().isoformat(), 
+                "response_time_ms": round(response_time, 2)
+            }
+            await websocket.send(json.dumps(response_message))
+            
+            # Log the voice message interaction
+            await self.chat_logger.log_chat({
+                'timestamp': datetime.now().isoformat(), 
+                'session_id': client_id, 
+                'message_type': 'voice_message',
+                'user_message': user_message, 
+                'assistant_response': ai_response, 
+                'response_time_ms': round(response_time, 2),
+                'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 
+                'message_length': len(user_message),
+                'voice_generated': True, 
+                'voice_voice_name': 'Auto', 
+                'error_message': '',
+                'client_agent': data.get('client_agent', 'unknown'), 
+                'processing_status': 'success'
+            })
+            
+            logger.info(f"Processed voice message from client {client_id[:8]}... in {response_time:.2f}ms")
+            
+        except Exception as e:
+            logger.error(f"Error handling voice message: {e}")
+            await websocket.send(json.dumps({"type": "error", "message": "An error occurred while processing your voice message", "timestamp": datetime.now().isoformat()}))
+            await self.chat_logger.log_chat({
+                'timestamp': datetime.now().isoformat(), 
+                'session_id': client_id, 
+                'message_type': 'voice_message',
+                'user_message': data.get('message', ''), 
+                'assistant_response': '', 
+                'response_time_ms': 0,
+                'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 
+                'message_length': len(data.get('message', '')),
+                'voice_generated': False, 
+                'voice_voice_name': '', 
+                'error_message': str(e),
+                'client_agent': data.get('client_agent', 'unknown'), 
+                'processing_status': 'error'
             })
     
     async def handle_client(self, websocket: WebSocketServerProtocol):
