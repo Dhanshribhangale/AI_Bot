@@ -11,6 +11,10 @@ let sessionId = null;
 const audioQueue = [];
 let isPlaying = false;
 
+// Add event listeners for voice functionality
+voiceBtn.addEventListener('click', toggleVoice);
+voiceSelect.addEventListener('change', onVoiceChange);
+
 function connectWebSocket() {
     ws = new WebSocket(`ws://${location.hostname}:8765`);
 
@@ -98,40 +102,106 @@ function requestVoice(text) {
             client_agent: navigator.userAgent
         };
         ws.send(JSON.stringify(payload));
+        statusDiv.textContent = 'Generating voice...';
+    } else {
+        addMessage('system', 'Connection not open. Please wait.');
     }
 }
 
-async function playAudio(url) {
-    audioQueue.push(url);
+// Voice toggle functionality
+function toggleVoice() {
+    isVoiceEnabled = !isVoiceEnabled;
+    if (isVoiceEnabled) {
+        voiceBtn.textContent = '🔇 Disable Voice';
+        voiceBtn.classList.add('active');
+        statusDiv.textContent = 'Voice enabled. AI responses will be spoken.';
+    } else {
+        voiceBtn.textContent = '🔊 Enable Voice';
+        voiceBtn.classList.remove('active');
+        statusDiv.textContent = 'Voice disabled.';
+        // Stop any currently playing audio
+        stopAllAudio();
+    }
+}
+
+// Handle voice selection change
+function onVoiceChange() {
+    const selectedVoice = voiceSelect.value;
+    statusDiv.textContent = `Voice changed to: ${selectedVoice}`;
+    console.log(`Voice changed to: ${selectedVoice}`);
+}
+
+// Audio queue management
+function addToAudioQueue(audioUrl) {
+    audioQueue.push(audioUrl);
     if (!isPlaying) {
-        await processQueue();
+        playNextInQueue();
     }
 }
 
-async function processQueue() {
+async function playNextInQueue() {
     if (audioQueue.length === 0) {
         isPlaying = false;
         return;
     }
-
+    
     isPlaying = true;
     const audioUrl = audioQueue.shift();
-    const audio = new Audio(audioUrl);
-    
-    await new Promise(resolve => {
-        audio.onended = resolve;
-        audio.play().catch(e => {
-            console.error('Audio playback failed:', e);
-            resolve();
-        });
-    });
-
-    URL.revokeObjectURL(audioUrl);
-    await processQueue();
+    await playAudio(audioUrl);
+    playNextInQueue();
 }
 
-function base64toBlob(base64, mimeType) {
-    const byteCharacters = atob(base64);
+// Stop all audio playback
+function stopAllAudio() {
+    // Clear the audio queue
+    audioQueue.length = 0;
+    isPlaying = false;
+    
+    // Stop any currently playing audio elements
+    const audioElements = document.querySelectorAll('audio');
+    audioElements.forEach(audio => {
+        audio.pause();
+        audio.currentTime = 0;
+    });
+}
+
+async function playAudio(url) {
+    return new Promise((resolve, reject) => {
+        const audio = new Audio(url);
+        
+        audio.onloadstart = () => {
+            statusDiv.textContent = 'Playing audio...';
+        };
+        
+        audio.oncanplay = () => {
+            statusDiv.textContent = 'Audio ready to play.';
+        };
+        
+        audio.onended = () => {
+            statusDiv.textContent = 'Ready to chat.';
+            URL.revokeObjectURL(url);
+            resolve();
+        };
+        
+        audio.onerror = (error) => {
+            console.error('Audio playback error:', error);
+            statusDiv.textContent = 'Audio playback error.';
+            URL.revokeObjectURL(url);
+            reject(error);
+        };
+        
+        audio.play().catch(error => {
+            console.error('Failed to play audio:', error);
+            statusDiv.textContent = 'Failed to play audio.';
+            URL.revokeObjectURL(url);
+            reject(error);
+        });
+    });
+}
+
+// Convert base64 to blob
+function base64toBlob(base64Data, mimeType) {
+    const byteCharacters = atob(base64Data);
     const byteNumbers = new Array(byteCharacters.length);
     for (let i = 0; i < byteCharacters.length; i++) {
         byteNumbers[i] = byteCharacters.charCodeAt(i);
@@ -140,24 +210,13 @@ function base64toBlob(base64, mimeType) {
     return new Blob([byteArray], { type: mimeType });
 }
 
+// Event listeners
 sendBtn.addEventListener('click', sendMessage);
-userInput.addEventListener('keypress', (event) => {
-    if (event.key === 'Enter') {
+userInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') {
         sendMessage();
     }
 });
 
-voiceBtn.addEventListener('click', () => {
-    isVoiceEnabled = !isVoiceEnabled;
-    if (isVoiceEnabled) {
-        voiceBtn.textContent = '🔇 Voice On';
-        voiceBtn.style.backgroundColor = '#dc3545';
-        voiceBtn.style.color = '#fff';
-    } else {
-        voiceBtn.textContent = '🔊 Text to Voice';
-        voiceBtn.style.backgroundColor = '#28a745';
-        voiceBtn.style.color = '#fff';
-    }
-});
-
-document.addEventListener('DOMContentLoaded', connectWebSocket);
+// Initialize
+connectWebSocket();
