@@ -4,14 +4,13 @@ import csv
 import os
 from datetime import datetime
 from typing import Dict, Any, Optional
-import google.generativeai as genai
-from google.generativeai import types
+from google import genai
+from google.genai import types
 import logging
 import time
 import io
 import struct
-import numpy as np
-import pyaudio
+
 from config import Config
 from collections import deque
 
@@ -49,8 +48,10 @@ class GeminiClient:
             if not api_key:
                 logger.error("Gemini API key not configured")
                 return False
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel(Config.CHAT_MODEL)
+            # For the new google-genai library, we need to set the API key differently
+            import os
+            os.environ['GOOGLE_API_KEY'] = api_key
+            self.model = Config.CHAT_MODEL
             self.initialized = True
             logger.info("Gemini client initialized successfully")
             return True
@@ -73,15 +74,18 @@ class GeminiClient:
                     context_parts.append(f"Assistant: {msg['assistant']}")
                 context = "\n".join(context_parts) + "\n\n"
             full_prompt = f"""You are a helpful AI assistant. Be concise, friendly, and helpful in your responses.\n\n{context}User: {user_message}\nAssistant:"""
+            
+            client = genai.Client()
             response = await asyncio.to_thread(
-                self.model.generate_content,
-                full_prompt,
-                generation_config=genai.types.GenerationConfig(
+                client.models.generate_content,
+                model=self.model,
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
                     max_output_tokens=Config.MAX_TOKENS,
                     temperature=Config.TEMPERATURE
                 )
             )
-            return response.text.strip()
+            return response.candidates[0].content.parts[0].text.strip()
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             return "I apologize, but I encountered an error while processing your request. Please try again."
@@ -93,26 +97,60 @@ class GeminiClient:
     # Task 6: Smart Summarizer
     async def smart_summarize(self, text: str):
         try:
+            client = genai.Client()
+            
             # Summarization
             summary_prompt = f"Summarize the following content concisely:\n\n{text}"
-            summary_response = await asyncio.to_thread(self.model.generate_content, summary_prompt)
-            summary = summary_response.text.strip()
+            summary_response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=self.model,
+                contents=summary_prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=Config.MAX_TOKENS,
+                    temperature=Config.TEMPERATURE
+                )
+            )
+            summary = summary_response.candidates[0].content.parts[0].text.strip()
 
             # Sentiment Detection
             sentiment_prompt = f"Analyze the sentiment of the following text: '{text}'. Respond with a single word: positive, negative, or neutral."
-            sentiment_response = await asyncio.to_thread(self.model.generate_content, sentiment_prompt)
-            sentiment = sentiment_response.text.strip()
+            sentiment_response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=self.model,
+                contents=sentiment_prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=Config.MAX_TOKENS,
+                    temperature=Config.TEMPERATURE
+                )
+            )
+            sentiment = sentiment_response.candidates[0].content.parts[0].text.strip()
 
             # Key Fact Extraction
             facts_prompt = f"Extract exactly 5 key facts from the following text:\n\n{text}"
-            facts_response = await asyncio.to_thread(self.model.generate_content, facts_prompt)
-            facts = facts_response.text.strip()
+            facts_response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=self.model,
+                contents=facts_prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=Config.MAX_TOKENS,
+                    temperature=Config.TEMPERATURE
+                )
+            )
+            facts = facts_response.candidates[0].content.parts[0].text.strip()
 
             # Conditional Resummarization
             if len(summary.split()) > 300:
                 resummarize_prompt = f"Resummarize the following text to under 200 words using bullet points:\n\n{summary}"
-                resummarized_response = await asyncio.to_thread(self.model.generate_content, resummarize_prompt)
-                summary = resummarized_response.text.strip()
+                resummarized_response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=self.model,
+                    contents=resummarize_prompt,
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=Config.MAX_TOKENS,
+                        temperature=Config.TEMPERATURE
+                    )
+                )
+                summary = resummarized_response.candidates[0].content.parts[0].text.strip()
 
             return {
                 "summary": summary,
@@ -141,32 +179,52 @@ class GeminiVoiceService:
             start_time = time.time()
             logger.info(f"Generating speech for: {text[:30]}...")
 
-            model = genai.GenerativeModel(self.model)
-            
-            # CORRECTED: Use a dictionary for `tts_options` and pass `response_modality` as a separate keyword argument.
-            response = await asyncio.to_thread(
-                model.generate_content,
-                text,
-                response_modality='audio',
-                tts_options={"voice": voice_name},
-                stream=True,
-            )
-
-            audio_data_chunks = []
-            for chunk in response:
-                audio_data_chunks.append(chunk.audio_data)
-            
-            audio_data = b''.join(audio_data_chunks)
-
-            if audio_data:
-                wav_data = self.convert_pcm_to_wav(audio_data)
-                self._add_to_cache(cache_key, wav_data)
-                generation_time = time.time() - start_time
-                logger.info(f"Speech generated in {generation_time:.2f}s for: {text[:30]}...")
-                return wav_data
-            else:
-                logger.error("No audio data in response")
+            # Use the correct API structure for Gemini 2.5 Flash Preview TTS
+            try:
+                client = genai.Client()
+                
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=self.model,
+                    contents=text,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=voice_name,
+                                )
+                            )
+                        ),
+                    )
+                )
+                
+                # Extract audio data from response
+                if hasattr(response, 'candidates') and response.candidates:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, 'content') and candidate.content:
+                        for part in candidate.content.parts:
+                            if hasattr(part, 'inline_data') and part.inline_data:
+                                audio_data = part.inline_data.data
+                                if audio_data:
+                                    # Decode base64 if needed
+                                    if isinstance(audio_data, str):
+                                        import base64
+                                        audio_data = base64.b64decode(audio_data)
+                                    
+                                    wav_data = self.convert_pcm_to_wav(audio_data)
+                                    self._add_to_cache(cache_key, wav_data)
+                                    generation_time = time.time() - start_time
+                                    logger.info(f"Speech generated in {generation_time:.2f}s for: {text[:30]}...")
+                                    return wav_data
+                
+                logger.error("No audio data found in response")
                 return None
+                
+            except Exception as api_error:
+                logger.error(f"API call failed: {api_error}")
+                return None
+
         except Exception as e:
             logger.error(f"Error generating speech: {e}")
             return None

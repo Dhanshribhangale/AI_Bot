@@ -5,7 +5,7 @@ Test script for Gemini Voice Service
 import asyncio
 import os
 from dotenv import load_dotenv
-from server import GeminiVoiceService, Config
+from services import GeminiVoiceService, Config
 
 async def test_voice_service():
     """Test the voice service functionality"""
@@ -16,10 +16,10 @@ async def test_voice_service():
     
     # Check API key
     api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key or api_key == 'AIzaSyC-U9ipSD-2592k6hqdXJjZOmO8OKK4j8Y':
+    if not api_key or api_key == 'your-gemini-api-key-here':
         print("❌ Error: GEMINI_API_KEY not set in .env file")
         print("Please create a .env file with your Gemini API key:")
-        print("GEMINI_API_KEY=AIzaSyC-U9ipSD-2592k6hqdXJjZOmO8OKK4j8Y")
+        print("GEMINI_API_KEY=your_actual_api_key_here")
         return False
     
     print(f"✅ API Key found: {api_key[:10]}...")

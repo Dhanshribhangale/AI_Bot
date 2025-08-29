@@ -4,6 +4,8 @@ import logging
 import uuid
 import base64
 import time
+import csv
+import io
 from datetime import datetime
 from typing import Set, Dict
 from aiohttp import web
@@ -13,7 +15,7 @@ from pathlib import Path
 import argparse
 import sys
 
-from server import Config, ChatLogger, GeminiClient, GeminiVoiceService
+from services import Config, ChatLogger, GeminiClient, GeminiVoiceService
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -143,10 +145,12 @@ class ChatbotWebSocketServer:
             if client_id:
                 await self.unregister_client(websocket, client_id)
 
-    async def start_server(self):
+    async def start_server(self, host=None, port=None):
         await self.initialize()
-        server = await serve(self.handle_client, Config.WS_HOST, Config.WS_PORT)
-        logger.info(f"WebSocket server started on ws://{Config.WS_HOST}:{Config.WS_PORT}")
+        host = host or Config.WS_HOST
+        port = port or Config.WS_PORT
+        server = await serve(self.handle_client, host, port)
+        logger.info(f"WebSocket server started on ws://{host}:{port}")
         logger.info(f"Gemini client ready: {self.ai_client.is_ready()}")
         await server.wait_closed()
 
@@ -434,14 +438,14 @@ class CombinedServer:
             logger.error(f"Error exporting logs: {e}")
             return web.json_response({"status": "error", "message": str(e)}, status=500)
     
-    async def start_servers(self):
-        websocket_task = asyncio.create_task(self.websocket_server.start_server())
+    async def start_servers(self, http_port=8000, ws_port=8765, ws_host='localhost'):
+        websocket_task = asyncio.create_task(self.websocket_server.start_server(ws_host, ws_port))
         runner = web.AppRunner(self.app)
         await runner.setup()
-        site = web.TCPSite(runner, 'localhost', 8000)
+        site = web.TCPSite(runner, 'localhost', http_port)
         await site.start()
-        logger.info("HTTP server started on http://localhost:8000")
-        logger.info("WebSocket server started on ws://localhost:8765")
+        logger.info(f"HTTP server started on http://localhost:{http_port}")
+        logger.info(f"WebSocket server started on ws://{ws_host}:{ws_port}")
         try:
             await websocket_task
         except KeyboardInterrupt:

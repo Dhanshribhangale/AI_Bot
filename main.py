@@ -3,7 +3,7 @@ import asyncio
 import sys
 import argparse
 import logging
-from server import CombinedServer
+from client import CombinedServer
 from config import Config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
