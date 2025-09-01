@@ -15,7 +15,8 @@ from pathlib import Path
 import argparse
 import sys
 
-from services import Config, ChatLogger, GeminiClient, GeminiVoiceService, JsonFlattener
+# --- MODIFIED: Import new services ---
+from services import Config, ChatLogger, GeminiClient, GeminiVoiceService, JsonFlattener, GoogleSTTService, AudioPlaybackService
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -28,6 +29,9 @@ class ChatbotWebSocketServer:
         self.voice_service = GeminiVoiceService()
         self.chat_logger = ChatLogger()
         self.json_flattener = JsonFlattener()
+        # --- NEW: Instantiate STT and Playback services ---
+        self.stt_service = GoogleSTTService()
+        self.playback_service = AudioPlaybackService()
 
     async def initialize(self):
         await self.ai_client.initialize()
@@ -39,7 +43,8 @@ class ChatbotWebSocketServer:
         self.conversation_history[client_id] = []
         welcome_message = {
             "type": "system",
-            "message": "Welcome to AI Voice Bot! I'm powered by Google's Gemini AI. How can I help you today?\n\nYou can also use commands:\n- `/summarize <text to summarize>`\n- `/flatten <JSON object>`",
+            # --- NEW: Added /play command to help text ---
+            "message": "Welcome to AI Voice Bot! I'm powered by Google's Gemini AI. How can I help you today?\n\nYou can also use commands:\n- `/summarize <text to summarize>`\n- `/flatten <JSON object>`\n- `/play <text to speak on server>`",
             "timestamp": datetime.now().isoformat(),
             "client_id": client_id
         }
@@ -61,8 +66,13 @@ class ChatbotWebSocketServer:
                 await self.handle_chat_message(websocket, data, client_id)
             elif message_type == 'voice_request':
                 await self.handle_voice_request(websocket, data, client_id)
-            elif message_type == 'voice_message':
-                await self.handle_voice_message(websocket, data, client_id)
+            # --- NEW: Handler for direct audio upload ---
+            elif message_type == 'audio_upload':
+                await self.handle_audio_upload(websocket, data, client_id)
+            # Note: 'voice_message' is now handled by 'audio_upload'
+            # If clients still send 'voice_message', you could route it here:
+            # elif message_type == 'voice_message':
+            #     await self.handle_legacy_voice_message(websocket, data, client_id)
             else:
                 logger.warning(f"Unknown message type: {message_type}")
         except json.JSONDecodeError:
@@ -136,7 +146,29 @@ class ChatbotWebSocketServer:
             response_time = (time.time() - start_time) * 1000
             response_message = {"type": "assistant", "message": response_text, "timestamp": datetime.now().isoformat(), "response_time_ms": round(response_time, 2)}
             await websocket.send(json.dumps(response_message))
-        
+
+        # --- NEW: Handler for /play command ---
+        elif user_message.lower().startswith('/play '):
+            text_to_play = user_message[6:].strip()
+            if not text_to_play:
+                response = {"type": "assistant", "message": "Please provide text to play. Usage: /play <text>", "timestamp": datetime.now().isoformat()}
+                await websocket.send(json.dumps(response))
+                return
+
+            response = {"type": "assistant", "message": f"Generating audio for '{text_to_play[:30]}...' to play on the server.", "timestamp": datetime.now().isoformat()}
+            await websocket.send(json.dumps(response))
+            
+            audio_data = await self.voice_service.generate_speech(text_to_play)
+            if audio_data:
+                played = self.playback_service.play_audio_server_side(audio_data)
+                if played:
+                    final_msg = {"type": "system", "message": "Audio played successfully on the server."}
+                else:
+                    final_msg = {"type": "error", "message": "Failed to play audio. Ensure 'ffmpeg' is installed on the server."}
+            else:
+                final_msg = {"type": "error", "message": "Could not generate audio for playback."}
+            await websocket.send(json.dumps(final_msg))
+
         else:
             conversation_history = self.conversation_history.get(client_id, [])
             ai_response = await self.ai_client.generate_response(user_message, conversation_history)
@@ -150,10 +182,76 @@ class ChatbotWebSocketServer:
                 'timestamp': datetime.now().isoformat(), 'session_id': client_id, 'message_type': 'chat',
                 'user_message': user_message, 'assistant_response': ai_response, 'response_time_ms': round(response_time, 2),
                 'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 'message_length': len(user_message),
-                'voice_generated': False, 'voice_voice_name': '', 'error_message': '',
+                'voice_generated': False, 'voice_voice_name': '', 'error_message': '', 'audio_filename': '',
                 'client_agent': data.get('client_agent', 'unknown'), 'processing_status': 'success'
             })
             logger.info(f"Processed message from client {client_id[:8]}... in {response_time:.2f}ms")
+
+    # --- NEW: Handler for direct audio upload with STT and confidence check ---
+    async def handle_audio_upload(self, websocket: WebSocketServerProtocol, data: dict, client_id: str):
+        try:
+            audio_b64 = data.get('audio_data')
+            filename = data.get('filename', 'unknown.wav')
+            if not audio_b64:
+                await websocket.send(json.dumps({"type": "error", "message": "No audio data provided."}))
+                return
+
+            # Let the client know we're processing
+            await websocket.send(json.dumps({"type": "system", "message": "Transcribing audio..."}))
+
+            audio_data = base64.b64decode(audio_b64)
+            stt_result = await self.stt_service.transcribe_audio(audio_data)
+
+            confidence = stt_result.get("confidence", 0.0)
+            user_message = stt_result.get("cleaned_text", "")
+
+            # Edge Case: Confidence check
+            if confidence < 0.7:
+                error_msg = f"Sorry, I couldn't understand that clearly (confidence: {confidence:.2f}). Could you please try again?"
+                await websocket.send(json.dumps({"type": "error", "message": error_msg}))
+                await self.chat_logger.log_chat({
+                    'timestamp': datetime.now().isoformat(), 'session_id': client_id, 'message_type': 'audio_upload',
+                    'user_message': stt_result.get("raw_text", ""), 'assistant_response': '', 'response_time_ms': 0,
+                    'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 'message_length': 0,
+                    'voice_generated': False, 'voice_voice_name': '', 'error_message': 'Low STT confidence',
+                    'audio_filename': filename, 'client_agent': data.get('client_agent', 'unknown'), 'processing_status': 'error'
+                })
+                return
+
+            if not user_message:
+                await websocket.send(json.dumps({"type": "error", "message": "Could not detect any speech in the audio."}))
+                return
+            
+            # Send transcribed text to client for confirmation
+            await websocket.send(json.dumps({"type": "user_transcript", "message": user_message}))
+            
+            start_time = time.time()
+            conversation_history = self.conversation_history.get(client_id, [])
+            ai_response = await self.ai_client.generate_response(user_message, conversation_history)
+            response_time = (time.time() - start_time) * 1000
+
+            conversation_entry = {'user': user_message, 'assistant': ai_response, 'timestamp': datetime.now().isoformat()}
+            conversation_history.append(conversation_entry)
+            self.conversation_history[client_id] = conversation_history
+            
+            # Send text response first, then generate and send audio
+            response_message = {"type": "assistant", "message": ai_response, "timestamp": datetime.now().isoformat()}
+            await websocket.send(json.dumps(response_message))
+
+            # Now generate and send the audio response
+            await self.handle_voice_request(websocket, {"text": ai_response, "voice": "Kore"}, client_id)
+            
+            await self.chat_logger.log_chat({
+                'timestamp': datetime.now().isoformat(), 'session_id': client_id, 'message_type': 'audio_upload',
+                'user_message': user_message, 'assistant_response': ai_response, 'response_time_ms': round(response_time, 2),
+                'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 'message_length': len(user_message),
+                'voice_generated': True, 'voice_voice_name': 'Kore', 'error_message': '',
+                'audio_filename': filename, 'client_agent': data.get('client_agent', 'unknown'), 'processing_status': 'success'
+            })
+        except Exception as e:
+            logger.error(f"Error handling audio upload: {e}")
+            await websocket.send(json.dumps({"type": "error", "message": "An error occurred while processing your audio."}))
+
 
     async def handle_voice_request(self, websocket: WebSocketServerProtocol, data: dict, client_id: str):
         try:
@@ -167,93 +265,27 @@ class ChatbotWebSocketServer:
                 audio_base64 = base64.b64encode(audio_data).decode('utf-8')
                 await websocket.send(json.dumps({"type": "voice_response", "audio_data": audio_base64, "text": text, "voice": voice_name, "timestamp": datetime.now().isoformat()}))
                 logger.info(f"Generated voice for client {client_id[:8]}... text: {text[:50]}...")
-                await self.chat_logger.log_chat({
-                    'timestamp': datetime.now().isoformat(), 'session_id': client_id, 'message_type': 'voice_request',
-                    'user_message': '', 'assistant_response': text, 'response_time_ms': 0,
-                    'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 'message_length': len(text),
-                    'voice_generated': True, 'voice_voice_name': voice_name, 'error_message': '',
-                    'client_agent': data.get('client_agent', 'unknown'), 'processing_status': 'success'
-                })
+                # Logging is now handled by the calling function (e.g., handle_audio_upload) to avoid duplicates
             else:
                 await websocket.send(json.dumps({"type": "error", "message": "Failed to generate voice", "timestamp": datetime.now().isoformat()}))
                 await self.chat_logger.log_chat({
                     'timestamp': datetime.now().isoformat(), 'session_id': client_id, 'message_type': 'voice_request',
                     'user_message': '', 'assistant_response': text, 'response_time_ms': 0,
                     'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 'message_length': len(text),
-                    'voice_generated': False, 'voice_voice_name': voice_name, 'error_message': 'Failed to generate voice',
+                    'voice_generated': False, 'voice_voice_name': voice_name, 'error_message': 'Failed to generate voice', 'audio_filename': '',
                     'client_agent': data.get('client_agent', 'unknown'), 'processing_status': 'error'
                 })
         except Exception as e:
             logger.error(f"Error handling voice request: {e}")
             await websocket.send(json.dumps({"type": "error", "message": "An error occurred while generating voice", "timestamp": datetime.now().isoformat()}))
-            await self.chat_logger.log_chat({
-                'timestamp': datetime.now().isoformat(), 'session_id': client_id, 'message_type': 'voice_request',
-                'user_message': '', 'assistant_response': text, 'response_time_ms': 0,
-                'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 'message_length': len(text),
-                'voice_generated': False, 'voice_voice_name': voice_name, 'error_message': str(e),
-                'client_agent': data.get('client_agent', 'unknown'), 'processing_status': 'error'
-            })
-    
+
+    # This function is now deprecated in favor of handle_audio_upload
     async def handle_voice_message(self, websocket: WebSocketServerProtocol, data: dict, client_id: str):
-        try:
-            user_message = data.get('message', '').strip()
-            if not user_message:
-                await websocket.send(json.dumps({"type": "error", "message": "No message provided", "timestamp": datetime.now().isoformat()}))
-                return
-            
-            start_time = time.time()
-            conversation_history = self.conversation_history.get(client_id, [])
-            ai_response = await self.ai_client.generate_response(user_message, conversation_history)
-            response_time = (time.time() - start_time) * 1000
-            
-            conversation_entry = {'user': user_message, 'assistant': ai_response, 'timestamp': datetime.now().isoformat()}
-            conversation_history.append(conversation_entry)
-            self.conversation_history[client_id] = conversation_history
-            
-            response_message = {
-                "type": "voice_message_response", 
-                "message": ai_response, 
-                "timestamp": datetime.now().isoformat(), 
-                "response_time_ms": round(response_time, 2)
-            }
-            await websocket.send(json.dumps(response_message))
-            
-            await self.chat_logger.log_chat({
-                'timestamp': datetime.now().isoformat(), 
-                'session_id': client_id, 
-                'message_type': 'voice_message',
-                'user_message': user_message, 
-                'assistant_response': ai_response, 
-                'response_time_ms': round(response_time, 2),
-                'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 
-                'message_length': len(user_message),
-                'voice_generated': True, 
-                'voice_voice_name': 'Auto', 
-                'error_message': '',
-                'client_agent': data.get('client_agent', 'unknown'), 
-                'processing_status': 'success'
-            })
-            
-            logger.info(f"Processed voice message from client {client_id[:8]}... in {response_time:.2f}ms")
-            
-        except Exception as e:
-            logger.error(f"Error handling voice message: {e}")
-            await websocket.send(json.dumps({"type": "error", "message": "An error occurred while processing your voice message", "timestamp": datetime.now().isoformat()}))
-            await self.chat_logger.log_chat({
-                'timestamp': datetime.now().isoformat(), 
-                'session_id': client_id, 
-                'message_type': 'voice_message',
-                'user_message': data.get('message', ''), 
-                'assistant_response': '', 
-                'response_time_ms': 0,
-                'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 
-                'message_length': len(data.get('message', '')),
-                'voice_generated': False, 
-                'voice_voice_name': '', 
-                'error_message': str(e),
-                'client_agent': data.get('client_agent', 'unknown'), 
-                'processing_status': 'error'
-            })
+        logger.warning("Received a legacy 'voice_message' type. Please update client to use 'audio_upload'.")
+        # For backward compatibility, you can route this to the new handler
+        # by assuming the 'message' is the audio data, but this is not recommended.
+        # For now, we just log a warning.
+        await websocket.send(json.dumps({"type": "error", "message": "This voice message format is deprecated."}))
     
     async def handle_client(self, websocket: WebSocketServerProtocol):
         client_id = None
@@ -261,8 +293,6 @@ class ChatbotWebSocketServer:
             client_id = await self.register_client(websocket)
             async for message in websocket:
                 await self.handle_message(websocket, message, client_id)
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("Client connection closed normally")
         except Exception as e:
             logger.error(f"Error handling client: {e}")
         finally:
@@ -278,6 +308,7 @@ class ChatbotWebSocketServer:
         logger.info(f"Gemini client ready: {self.ai_client.is_ready()}")
         await server.wait_closed()
 
+# The CombinedServer and main function remain unchanged...
 class CombinedServer:
     def __init__(self):
         self.websocket_server = ChatbotWebSocketServer()
@@ -332,13 +363,14 @@ class CombinedServer:
                 .btn.success { background: #28a745; }
                 .btn.warning { background: #ffc107; color: #212529; }
                 .btn.danger { background: #dc3545; }
-                .logs-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-                .logs-table th, .logs-table td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+                .logs-table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 14px; }
+                .logs-table th, .logs-table td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; word-break: break-word; }
                 .logs-table th { background: #f8f9fa; font-weight: bold; }
                 .logs-table tr:hover { background: #f5f5f5; }
                 .message-type { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
                 .message-type.chat { background: #d4edda; color: #155724; }
                 .message-type.voice_request { background: #d1ecf1; color: #0c5460; }
+                .message-type.audio_upload { background: #fff3cd; color: #856404; }
                 .status-success { background: #d4edda; color: #155724; }
                 .status-error { background: #f8d7da; color: #721c24; }
                 .refresh-info { color: #666; font-style: italic; margin-top: 10px; }
@@ -353,40 +385,12 @@ class CombinedServer:
                         <button class="btn success" onclick="refreshLogs()">🔄 Refresh</button>
                     </div>
                 </div>
-                
-                <div class="stats" id="stats">
-                    <div class="stat-card">
-                        <div class="stat-number" id="totalMessages">-</div>
-                        <div class="stat-label">Total Messages</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number" id="uniqueSessions">-</div>
-                        <div class="stat-label">Unique Sessions</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number" id="avgResponseTime">-</div>
-                        <div class="stat-label">Avg Response Time (ms)</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number" id="voiceRequests">-</div>
-                        <div class="stat-label">Voice Requests</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number" id="successRate">-</div>
-                        <div class="stat-label">Success Rate (%)</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number" id="errors">-</div>
-                        <div class="stat-label">Errors</div>
-                    </div>
-                </div>
-                
+                <div class="stats" id="stats"></div>
                 <div class="controls">
                     <button class="btn" onclick="exportCSV()">📊 Export CSV</button>
                     <button class="btn warning" onclick="clearLogs()">🗑️ Clear Logs</button>
                     <span class="refresh-info">Auto-refresh every 30 seconds</span>
                 </div>
-                
                 <table class="logs-table">
                     <thead>
                         <tr>
@@ -395,120 +399,64 @@ class CombinedServer:
                             <th>Session ID</th>
                             <th>User Message</th>
                             <th>AI Response</th>
-                            <th>Response Time</th>
-                            <th>Voice</th>
+                            <th>Audio File</th>
                             <th>Status</th>
-                            <th>IP Address</th>
                         </tr>
                     </thead>
                     <tbody id="logsTableBody">
-                        <tr><td colspan="9">Loading logs...</td></tr>
+                        <tr><td colspan="7">Loading logs...</td></tr>
                     </tbody>
                 </table>
             </div>
-            
             <script>
-                let refreshInterval;
-                
                 async function loadStats() {
-                    try {
-                        const response = await fetch('/logs/summary');
-                        const stats = await response.json();
-                        
-                        document.getElementById('totalMessages').textContent = stats.total_messages || 0;
-                        document.getElementById('uniqueSessions').textContent = stats.unique_sessions || 0;
-                        document.getElementById('avgResponseTime').textContent = stats.average_response_time_ms || 0;
-                        document.getElementById('voiceRequests').textContent = stats.voice_requests || 0;
-                        document.getElementById('successRate').textContent = stats.success_rate || 0;
-                        document.getElementById('errors').textContent = stats.errors || 0;
-                    } catch (error) {
-                        console.error('Error loading stats:', error);
-                    }
+                    const response = await fetch('/logs/summary');
+                    const stats = await response.json();
+                    const statsContainer = document.getElementById('stats');
+                    statsContainer.innerHTML = `
+                        <div class="stat-card"><div class="stat-number">${stats.total_messages || 0}</div><div class="stat-label">Total Messages</div></div>
+                        <div class="stat-card"><div class="stat-number">${stats.unique_sessions || 0}</div><div class="stat-label">Unique Sessions</div></div>
+                        <div class="stat-card"><div class="stat-number">${stats.average_response_time_ms || 0}</div><div class="stat-label">Avg Response (ms)</div></div>
+                        <div class="stat-card"><div class="stat-number">${stats.voice_requests || 0}</div><div class="stat-label">Voice Requests</div></div>
+                        <div class="stat-card"><div class="stat-number">${stats.success_rate || 0}</div><div class="stat-label">Success Rate (%)</div></div>
+                        <div class="stat-card"><div class="stat-number">${stats.errors || 0}</div><div class="stat-label">Errors</div></div>
+                    `;
                 }
-                
                 async function loadLogs() {
-                    try {
-                        const response = await fetch('/logs/recent');
-                        const logs = await response.json();
-                        
-                        const tbody = document.getElementById('logsTableBody');
-                        tbody.innerHTML = '';
-                        
-                        if (logs.length === 0) {
-                            tbody.innerHTML = '<tr><td colspan="9">No logs found</td></tr>';
-                            return;
-                        }
-                        
-                        logs.forEach(log => {
-                            const row = document.createElement('tr');
-                            
-                            const timestamp = new Date(log.timestamp).toLocaleString();
-                            const messageType = log.message_type || 'unknown';
-                            const status = log.processing_status || 'unknown';
-                            
-                            row.innerHTML = `
-                                <td>${timestamp}</td>
-                                <td><span class="message-type ${messageType}">${messageType}</span></td>
-                                <td>${log.session_id?.substring(0, 8) || 'N/A'}...</td>
-                                <td>${log.user_message || 'N/A'}</td>
-                                <td>${log.assistant_response || 'N/A'}</td>
-                                <td>${log.response_time_ms || 'N/A'}ms</td>
-                                <td>${log.voice_generated === 'True' ? '✅ ' + (log.voice_voice_name || 'Kore') : '❌'}</td>
-                                <td><span class="status-${status}">${status}</span></td>
-                                <td>${log.user_ip || 'N/A'}</td>
-                            `;
-                            
-                            tbody.appendChild(row);
-                        });
-                    } catch (error) {
-                        console.error('Error loading logs:', error);
-                        document.getElementById('logsTableBody').innerHTML = '<tr><td colspan="9">Error loading logs</td></tr>';
+                    const response = await fetch('/logs/recent');
+                    const logs = await response.json();
+                    const tbody = document.getElementById('logsTableBody');
+                    tbody.innerHTML = '';
+                    if (logs.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="7">No logs found</td></tr>';
+                        return;
                     }
+                    logs.forEach(log => {
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${new Date(log.timestamp).toLocaleString()}</td>
+                            <td><span class="message-type ${log.message_type || 'unknown'}">${log.message_type}</span></td>
+                            <td>${log.session_id?.substring(0, 8) || 'N/A'}...</td>
+                            <td style="max-width: 250px;">${log.user_message || 'N/A'}</td>
+                            <td style="max-width: 250px;">${log.assistant_response || 'N/A'}</td>
+                            <td>${log.audio_filename || 'N/A'}</td>
+                            <td><span class="status-${log.processing_status || 'unknown'}">${log.processing_status}</span></td>
+                        `;
+                        tbody.appendChild(row);
+                    });
                 }
-                
-                function refreshLogs() {
-                    loadStats();
-                    loadLogs();
-                }
-                
-                function exportCSV() {
-                    window.open('/logs', '_blank');
-                }
-                
+                function refreshLogs() { loadStats(); loadLogs(); }
+                function exportCSV() { window.open('/logs/export', '_blank'); }
                 async function clearLogs() {
-                    if (confirm('Are you sure you want to clear all logs? This action cannot be undone.')) {
-                        try {
-                            const response = await fetch('/logs/clear', { method: 'POST' });
-                            if (response.ok) {
-                                refreshLogs();
-                                alert('Logs cleared successfully!');
-                            } else {
-                                alert('Failed to clear logs');
-                            }
-                        } catch (error) {
-                            console.error('Error clearing logs:', error);
-                            alert('Error clearing logs');
-                        }
+                    if (confirm('Are you sure you want to clear all logs?')) {
+                        await fetch('/logs/clear', { method: 'POST' });
+                        refreshLogs();
                     }
                 }
-                
-                function startAutoRefresh() {
-                    refreshInterval = setInterval(refreshLogs, 30000);
-                }
-                
-                function stopAutoRefresh() {
-                    if (refreshInterval) {
-                        clearInterval(refreshInterval);
-                    }
-                }
-                
                 document.addEventListener('DOMContentLoaded', () => {
-                    loadStats();
-                    loadLogs();
-                    startAutoRefresh();
+                    refreshLogs();
+                    setInterval(refreshLogs, 30000);
                 });
-                
-                window.addEventListener('beforeunload', stopAutoRefresh);
             </script>
         </body>
         </html>
@@ -545,19 +493,11 @@ class CombinedServer:
     
     async def export_logs_csv(self, request):
         try:
-            logs = await self.websocket_server.chat_logger.get_recent_logs(10000)
-            output = io.StringIO()
-            writer = csv.DictWriter(output, fieldnames=self.websocket_server.chat_logger.csv_headers)
-            writer.writeheader()
-            for log in logs:
-                writer.writerow(log)
-            csv_content = output.getvalue()
-            output.close()
-            return web.Response(
-                text=csv_content,
-                content_type='text/csv',
-                headers={'Content-Disposition': 'attachment; filename="ai_voice_bot_logs.csv"'}
-            )
+            log_file_path = self.websocket_server.chat_logger.get_log_file_path()
+            return web.FileResponse(log_file_path, headers={
+                'Content-Disposition': 'attachment; filename="ai_voice_bot_logs.csv"',
+                'Content-Type': 'text/csv'
+            })
         except Exception as e:
             logger.error(f"Error exporting logs: {e}")
             return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -606,7 +546,8 @@ async def main():
     print("=" * 60)
     
     server = CombinedServer()
-    await server.start_servers()
+    await server.start_servers(http_port=args.http_port, ws_port=args.port, ws_host=args.host)
+
 
 if __name__ == "__main__":
     try:

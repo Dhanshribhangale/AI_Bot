@@ -10,32 +10,90 @@ import logging
 import time
 import io
 import struct
+import subprocess
+
+# Add google-cloud-speech for real STT
+# You will need to install it: pip install google-cloud-speech
+from google.cloud import speech
 
 from config import Config
 from collections import deque
 
 logger = logging.getLogger(__name__)
 
-# Day 2: Speech-to-Text & Text-to-Speech (Voice I/O)
-# Task 3: Speech-to-Text API and Task 4: Text-to-Speech Responder
-# Note: For simplicity and to focus on the core task logic, a basic mock STT is used. 
-# A real implementation would involve a service like Google Cloud Speech-to-Text or OpenAI Whisper.
+# --- NEW: Real Speech-to-Text Service using Google Cloud STT ---
+# This replaces the DummySTTService
+class GoogleSTTService:
+    def __init__(self):
+        # This will automatically use the credentials set up in your environment
+        # (e.g., GOOGLE_APPLICATION_CREDENTIALS environment variable)
+        try:
+            self.client = speech.SpeechAsyncClient()
+            logger.info("Google Cloud Speech-to-Text client initialized.")
+        except Exception as e:
+            self.client = None
+            logger.error(f"Could not initialize Google STT client: {e}")
+            logger.error("Please ensure you have authenticated with Google Cloud SDK.")
 
-class DummySTTService:
     async def transcribe_audio(self, audio_data: bytes, confidence_threshold: float = 0.7):
-        # This is a mock implementation.
-        # A real implementation would send audio to a service like Google Cloud STT.
-        confidence = 0.85 # Assume a high confidence for this demo
-        text = "Hello, this is a transcribed message."
-        
-        # Simulating filler word removal
-        cleaned_text = text.replace("um", "").replace("uh", "").strip()
-        
-        return {
-            "raw_text": text,
-            "cleaned_text": cleaned_text,
-            "confidence": confidence
-        }
+        if not self.client:
+            return {
+                "raw_text": "",
+                "cleaned_text": "",
+                "confidence": 0.0,
+                "error": "STT service is not configured."
+            }
+            
+        recognition_audio = speech.RecognitionAudio(content=audio_data)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=24000, # Matching the TTS output rate
+            language_code="en-US",
+            enable_automatic_punctuation=True
+        )
+
+        try:
+            operation = await self.client.long_running_recognize(config=config, audio=recognition_audio)
+            response = await asyncio.wrap_future(operation.result(timeout=90))
+            
+            if response.results:
+                best_alternative = response.results[0].alternatives[0]
+                text = best_alternative.transcript
+                confidence = best_alternative.confidence
+                
+                # Simple filler word removal
+                filler_words = ["um", "uh", "hmm"]
+                cleaned_text = ' '.join([word for word in text.split() if word.lower() not in filler_words]).strip()
+                
+                return {
+                    "raw_text": text,
+                    "cleaned_text": cleaned_text,
+                    "confidence": confidence
+                }
+            else:
+                return {"raw_text": "", "cleaned_text": "", "confidence": 0.0}
+        except Exception as e:
+            logger.error(f"Error during STT transcription: {e}")
+            return {"raw_text": "", "cleaned_text": "", "confidence": 0.0, "error": str(e)}
+
+# --- NEW: Utility for Server-Side Audio Playback ---
+class AudioPlaybackService:
+    @staticmethod
+    def play_audio_server_side(audio_data: bytes):
+        """Plays audio data on the server using ffplay."""
+        try:
+            # ffplay is part of the ffmpeg suite. It needs to be installed on the server.
+            command = ["ffplay", "-nodisp", "-autoexit", "-"]
+            proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.communicate(input=audio_data)
+            logger.info("Successfully played audio on server.")
+            return True
+        except FileNotFoundError:
+            logger.error("ffplay not found. Please install ffmpeg to use server-side audio playback.")
+            return False
+        except Exception as e:
+            logger.error(f"Error playing audio on server: {e}")
+            return False
 
 class GeminiClient:
     def __init__(self):
@@ -93,8 +151,6 @@ class GeminiClient:
     def is_ready(self) -> bool:
         return self.initialized
     
-    # Day 3: Intermediate Python Logic Challenges
-    # Task 6: Smart Summarizer
     async def smart_summarize(self, text: str):
         try:
             client = genai.Client()
@@ -179,7 +235,6 @@ class GeminiVoiceService:
             start_time = time.time()
             logger.info(f"Generating speech for: {text[:30]}...")
 
-            # Use the correct API structure for Gemini 2.5 Flash Preview TTS
             try:
                 client = genai.Client()
                 
@@ -199,7 +254,6 @@ class GeminiVoiceService:
                     )
                 )
                 
-                # Extract audio data from response
                 if hasattr(response, 'candidates') and response.candidates:
                     candidate = response.candidates[0]
                     if hasattr(candidate, 'content') and candidate.content:
@@ -207,7 +261,6 @@ class GeminiVoiceService:
                             if hasattr(part, 'inline_data') and part.inline_data:
                                 audio_data = part.inline_data.data
                                 if audio_data:
-                                    # Decode base64 if needed
                                     if isinstance(audio_data, str):
                                         import base64
                                         audio_data = base64.b64decode(audio_data)
@@ -285,10 +338,11 @@ class GeminiVoiceService:
 class ChatLogger:
     def __init__(self, log_file: str = None):
         self.log_file = log_file or Config.LOG_FILE
+        # --- MODIFIED: Added audio_filename to headers ---
         self.csv_headers = [
             'timestamp', 'session_id', 'message_type', 'user_message', 'assistant_response',
             'response_time_ms', 'user_ip', 'message_length', 'voice_generated', 'voice_voice_name',
-            'error_message', 'client_agent', 'processing_status'
+            'error_message', 'client_agent', 'processing_status', 'audio_filename'
         ]
         self._ensure_log_file_exists()
 
@@ -334,6 +388,9 @@ class ChatLogger:
                             try:
                                 reader = csv.reader(io.StringIO(line))
                                 row_values = next(reader)
+                                # Pad row_values if new columns were added to an old log file
+                                if len(row_values) < len(self.csv_headers):
+                                    row_values.extend([''] * (len(self.csv_headers) - len(row_values)))
                                 row = dict(zip(self.csv_headers, row_values))
                                 logs.append(row)
                             except Exception:
@@ -355,6 +412,8 @@ class ChatLogger:
                         try:
                             reader = csv.reader(io.StringIO(line))
                             row_values = next(reader)
+                            if len(row_values) < len(self.csv_headers):
+                                    row_values.extend([''] * (len(self.csv_headers) - len(row_values)))
                             row = dict(zip(self.csv_headers, row_values))
                             total_messages += 1
                             total_response_time += float(row.get('response_time_ms', 0))
@@ -379,8 +438,6 @@ class ChatLogger:
             logger.error(f"Error getting log summary: {e}")
             return {}
 
-# Day 3: Intermediate Python Logic Challenges
-# Task 5: Deep JSON Flattener
 class JsonFlattener:
     def flatten_dfs(self, data: dict, parent_key: str = '', sep: str = '.') -> dict:
         items = {}
