@@ -15,7 +15,7 @@ from pathlib import Path
 import argparse
 import sys
 
-from services import Config, ChatLogger, GeminiClient, GeminiVoiceService
+from services import Config, ChatLogger, GeminiClient, GeminiVoiceService, JsonFlattener
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ class ChatbotWebSocketServer:
         self.ai_client = GeminiClient()
         self.voice_service = GeminiVoiceService()
         self.chat_logger = ChatLogger()
+        self.json_flattener = JsonFlattener()
 
     async def initialize(self):
         await self.ai_client.initialize()
@@ -38,7 +39,7 @@ class ChatbotWebSocketServer:
         self.conversation_history[client_id] = []
         welcome_message = {
             "type": "system",
-            "message": "Welcome to AI Voice Bot! I'm powered by Google's Gemini AI. How can I help you today?",
+            "message": "Welcome to AI Voice Bot! I'm powered by Google's Gemini AI. How can I help you today?\n\nYou can also use commands:\n- `/summarize <text to summarize>`\n- `/flatten <JSON object>`",
             "timestamp": datetime.now().isoformat(),
             "client_id": client_id
         }
@@ -76,24 +77,84 @@ class ChatbotWebSocketServer:
         user_message = data.get('message', '').strip()
         if not user_message:
             return
+
         start_time = time.time()
-        conversation_history = self.conversation_history.get(client_id, [])
-        ai_response = await self.ai_client.generate_response(user_message, conversation_history)
-        response_time = (time.time() - start_time) * 1000
-        conversation_entry = {'user': user_message, 'assistant': ai_response, 'timestamp': datetime.now().isoformat()}
-        conversation_history.append(conversation_entry)
-        self.conversation_history[client_id] = conversation_history
-        response_message = {"type": "assistant", "message": ai_response, "timestamp": datetime.now().isoformat(), "response_time_ms": round(response_time, 2)}
-        await websocket.send(json.dumps(response_message))
-        await self.chat_logger.log_chat({
-            'timestamp': datetime.now().isoformat(), 'session_id': client_id, 'message_type': 'chat',
-            'user_message': user_message, 'assistant_response': ai_response, 'response_time_ms': round(response_time, 2),
-            'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 'message_length': len(user_message),
-            'voice_generated': False, 'voice_voice_name': '', 'error_message': '',
-            'client_agent': data.get('client_agent', 'unknown'), 'processing_status': 'success'
-        })
-        logger.info(f"Processed message from client {client_id[:8]}... in {response_time:.2f}ms")
-    
+        
+        if user_message.lower().startswith('/summarize '):
+            text_to_summarize = user_message[11:].strip()
+            if not text_to_summarize:
+                response = {"type": "assistant", "message": "Please provide text to summarize. Usage: /summarize <text>", "timestamp": datetime.now().isoformat()}
+                await websocket.send(json.dumps(response))
+                return
+            
+            thinking_msg = {"type": "assistant", "message": "Analyzing your text...", "timestamp": datetime.now().isoformat()}
+            await websocket.send(json.dumps(thinking_msg))
+
+            summary_result = await self.ai_client.smart_summarize(text_to_summarize)
+            
+            if summary_result:
+                response_text = (
+                    f"**📝 Smart Summary Report**\n\n"
+                    f"**Sentiment:** {summary_result['sentiment']}\n\n"
+                    f"**Key Facts:**\n{summary_result['key_facts']}\n\n"
+                    f"**Summary:**\n{summary_result['summary']}"
+                )
+            else:
+                response_text = "Sorry, I couldn't generate a summary. Please try again."
+            
+            response_time = (time.time() - start_time) * 1000
+            response_message = {"type": "assistant", "message": response_text, "timestamp": datetime.now().isoformat(), "response_time_ms": round(response_time, 2)}
+            await websocket.send(json.dumps(response_message))
+
+        elif user_message.lower().startswith('/flatten '):
+            json_string = user_message[9:].strip()
+            if not json_string:
+                response = {"type": "assistant", "message": "Please provide a JSON object. Usage: /flatten <json>", "timestamp": datetime.now().isoformat()}
+                await websocket.send(json.dumps(response))
+                return
+            
+            try:
+                json_data = json.loads(json_string)
+                if not isinstance(json_data, dict):
+                    raise TypeError("Input must be a JSON object.")
+
+                dfs_result = self.json_flattener.flatten_dfs(json_data)
+                bfs_result = self.json_flattener.flatten_bfs(json_data)
+
+                response_text = (
+                    f"**📊 JSON Flattening Results**\n\n"
+                    f"**DFS (Depth-First) Result:**\n```json\n{json.dumps(dfs_result, indent=2)}\n```\n\n"
+                    f"**BFS (Breadth-First) Result:**\n```json\n{json.dumps(bfs_result, indent=2)}\n```"
+                )
+            except json.JSONDecodeError:
+                response_text = "Error: Invalid JSON provided. Please check the format."
+            except TypeError as e:
+                response_text = f"Error: {e}. Input must be a valid JSON object starting with {{ }}."
+            except Exception as e:
+                response_text = f"An unexpected error occurred: {e}"
+
+            response_time = (time.time() - start_time) * 1000
+            response_message = {"type": "assistant", "message": response_text, "timestamp": datetime.now().isoformat(), "response_time_ms": round(response_time, 2)}
+            await websocket.send(json.dumps(response_message))
+        
+        else:
+            conversation_history = self.conversation_history.get(client_id, [])
+            ai_response = await self.ai_client.generate_response(user_message, conversation_history)
+            response_time = (time.time() - start_time) * 1000
+            conversation_entry = {'user': user_message, 'assistant': ai_response, 'timestamp': datetime.now().isoformat()}
+            conversation_history.append(conversation_entry)
+            self.conversation_history[client_id] = conversation_history
+            response_message = {"type": "assistant", "message": ai_response, "timestamp": datetime.now().isoformat(), "response_time_ms": round(response_time, 2)}
+            await websocket.send(json.dumps(response_message))
+            await self.chat_logger.log_chat({
+                'timestamp': datetime.now().isoformat(), 'session_id': client_id, 'message_type': 'chat',
+                'user_message': user_message, 'assistant_response': ai_response, 'response_time_ms': round(response_time, 2),
+                'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 'message_length': len(user_message),
+                'voice_generated': False, 'voice_voice_name': '', 'error_message': '',
+                'client_agent': data.get('client_agent', 'unknown'), 'processing_status': 'success'
+            })
+            logger.info(f"Processed message from client {client_id[:8]}... in {response_time:.2f}ms")
+
     async def handle_voice_request(self, websocket: WebSocketServerProtocol, data: dict, client_id: str):
         try:
             text = data.get('text', '').strip()
@@ -140,18 +201,15 @@ class ChatbotWebSocketServer:
                 await websocket.send(json.dumps({"type": "error", "message": "No message provided", "timestamp": datetime.now().isoformat()}))
                 return
             
-            # Generate AI response to the voice input
             start_time = time.time()
             conversation_history = self.conversation_history.get(client_id, [])
             ai_response = await self.ai_client.generate_response(user_message, conversation_history)
             response_time = (time.time() - start_time) * 1000
             
-            # Update conversation history
             conversation_entry = {'user': user_message, 'assistant': ai_response, 'timestamp': datetime.now().isoformat()}
             conversation_history.append(conversation_entry)
             self.conversation_history[client_id] = conversation_history
             
-            # Send the AI response as a voice message response
             response_message = {
                 "type": "voice_message_response", 
                 "message": ai_response, 
@@ -160,7 +218,6 @@ class ChatbotWebSocketServer:
             }
             await websocket.send(json.dumps(response_message))
             
-            # Log the voice message interaction
             await self.chat_logger.log_chat({
                 'timestamp': datetime.now().isoformat(), 
                 'session_id': client_id, 

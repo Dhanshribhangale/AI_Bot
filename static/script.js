@@ -213,7 +213,28 @@ function connectWebSocket() {
 function addMessage(sender, message) {
     const messageDiv = document.createElement('div');
     messageDiv.classList.add('message', sender);
-    messageDiv.textContent = message;
+
+    // Sanitize text before inserting as HTML to prevent XSS
+    const escapeHtml = (unsafe) => {
+        return unsafe
+             .replace(/&/g, "&amp;")
+             .replace(/</g, "&lt;")
+             .replace(/>/g, "&gt;")
+             .replace(/"/g, "&quot;")
+             .replace(/'/g, "&#039;");
+    };
+
+    if (sender === 'assistant' || sender === 'system') {
+        let formattedMessage = escapeHtml(message);
+        formattedMessage = formattedMessage.replace(/\n/g, '<br>');
+        formattedMessage = formattedMessage.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
+        formattedMessage = formattedMessage.replace(/```json\n([\s\S]*?)\n```/g, (match, p1) => `<pre><code>${p1.trim()}</code></pre>`);
+        formattedMessage = formattedMessage.replace(/```([\s\S]*?)```/g, (match, p1) => `<pre><code>${p1.trim()}</code></pre>`);
+        messageDiv.innerHTML = formattedMessage;
+    } else {
+        messageDiv.textContent = message;
+    }
+    
     chatMessages.appendChild(messageDiv);
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
