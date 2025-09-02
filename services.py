@@ -21,12 +21,8 @@ from collections import deque
 
 logger = logging.getLogger(__name__)
 
-# --- NEW: Real Speech-to-Text Service using Google Cloud STT ---
-# This replaces the DummySTTService
 class GoogleSTTService:
     def __init__(self):
-        # This will automatically use the credentials set up in your environment
-        # (e.g., GOOGLE_APPLICATION_CREDENTIALS environment variable)
         try:
             self.client = speech.SpeechAsyncClient()
             logger.info("Google Cloud Speech-to-Text client initialized.")
@@ -47,7 +43,7 @@ class GoogleSTTService:
         recognition_audio = speech.RecognitionAudio(content=audio_data)
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=24000, # Matching the TTS output rate
+            sample_rate_hertz=24000,
             language_code="en-US",
             enable_automatic_punctuation=True
         )
@@ -61,7 +57,6 @@ class GoogleSTTService:
                 text = best_alternative.transcript
                 confidence = best_alternative.confidence
                 
-                # Simple filler word removal
                 filler_words = ["um", "uh", "hmm"]
                 cleaned_text = ' '.join([word for word in text.split() if word.lower() not in filler_words]).strip()
                 
@@ -76,13 +71,10 @@ class GoogleSTTService:
             logger.error(f"Error during STT transcription: {e}")
             return {"raw_text": "", "cleaned_text": "", "confidence": 0.0, "error": str(e)}
 
-# --- NEW: Utility for Server-Side Audio Playback ---
 class AudioPlaybackService:
     @staticmethod
     def play_audio_server_side(audio_data: bytes):
-        """Plays audio data on the server using ffplay."""
         try:
-            # ffplay is part of the ffmpeg suite. It needs to be installed on the server.
             command = ["ffplay", "-nodisp", "-autoexit", "-"]
             proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             proc.communicate(input=audio_data)
@@ -106,7 +98,6 @@ class GeminiClient:
             if not api_key:
                 logger.error("Gemini API key not configured")
                 return False
-            # For the new google-genai library, we need to set the API key differently
             import os
             os.environ['GOOGLE_API_KEY'] = api_key
             self.model = Config.CHAT_MODEL
@@ -155,7 +146,6 @@ class GeminiClient:
         try:
             client = genai.Client()
             
-            # Summarization
             summary_prompt = f"Summarize the following content concisely:\n\n{text}"
             summary_response = await asyncio.to_thread(
                 client.models.generate_content,
@@ -168,7 +158,6 @@ class GeminiClient:
             )
             summary = summary_response.candidates[0].content.parts[0].text.strip()
 
-            # Sentiment Detection
             sentiment_prompt = f"Analyze the sentiment of the following text: '{text}'. Respond with a single word: positive, negative, or neutral."
             sentiment_response = await asyncio.to_thread(
                 client.models.generate_content,
@@ -181,7 +170,6 @@ class GeminiClient:
             )
             sentiment = sentiment_response.candidates[0].content.parts[0].text.strip()
 
-            # Key Fact Extraction
             facts_prompt = f"Extract exactly 5 key facts from the following text:\n\n{text}"
             facts_response = await asyncio.to_thread(
                 client.models.generate_content,
@@ -194,7 +182,6 @@ class GeminiClient:
             )
             facts = facts_response.candidates[0].content.parts[0].text.strip()
 
-            # Conditional Resummarization
             if len(summary.split()) > 300:
                 resummarize_prompt = f"Resummarize the following text to under 200 words using bullet points:\n\n{summary}"
                 resummarized_response = await asyncio.to_thread(
@@ -208,11 +195,17 @@ class GeminiClient:
                 )
                 summary = resummarized_response.candidates[0].content.parts[0].text.strip()
 
-            return {
-                "summary": summary,
-                "sentiment": sentiment,
-                "key_facts": facts
+            # --- PREPARE AND DEBUG RESULTS ---
+            result_data = {
+                "summary": summary or "A summary could not be generated.",
+                "sentiment": sentiment or "Not available",
+                "key_facts": facts or "No key facts could be extracted."
             }
+
+            print("--- DEBUG in services.py ---")
+            print(f"Data being returned: {result_data}")
+
+            return result_data
 
         except Exception as e:
             logger.error(f"Error in smart summarizer: {e}")
@@ -338,7 +331,6 @@ class GeminiVoiceService:
 class ChatLogger:
     def __init__(self, log_file: str = None):
         self.log_file = log_file or Config.LOG_FILE
-        # --- MODIFIED: Added audio_filename to headers ---
         self.csv_headers = [
             'timestamp', 'session_id', 'message_type', 'user_message', 'assistant_response',
             'response_time_ms', 'user_ip', 'message_length', 'voice_generated', 'voice_voice_name',
@@ -388,7 +380,6 @@ class ChatLogger:
                             try:
                                 reader = csv.reader(io.StringIO(line))
                                 row_values = next(reader)
-                                # Pad row_values if new columns were added to an old log file
                                 if len(row_values) < len(self.csv_headers):
                                     row_values.extend([''] * (len(self.csv_headers) - len(row_values)))
                                 row = dict(zip(self.csv_headers, row_values))

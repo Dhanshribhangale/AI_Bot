@@ -15,7 +15,6 @@ from pathlib import Path
 import argparse
 import sys
 
-# --- MODIFIED: Import new services ---
 from services import Config, ChatLogger, GeminiClient, GeminiVoiceService, JsonFlattener, GoogleSTTService, AudioPlaybackService
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,21 +28,19 @@ class ChatbotWebSocketServer:
         self.voice_service = GeminiVoiceService()
         self.chat_logger = ChatLogger()
         self.json_flattener = JsonFlattener()
-        # --- NEW: Instantiate STT and Playback services ---
         self.stt_service = GoogleSTTService()
         self.playback_service = AudioPlaybackService()
 
     async def initialize(self):
         await self.ai_client.initialize()
         logger.info("WebSocket server initialized successfully")
-    
+
     async def register_client(self, websocket: WebSocketServerProtocol):
         self.clients.add(websocket)
         client_id = str(uuid.uuid4())
         self.conversation_history[client_id] = []
         welcome_message = {
             "type": "system",
-            # --- NEW: Added /play command to help text ---
             "message": "Welcome to AI Voice Bot! I'm powered by Google's Gemini AI. How can I help you today?\n\nYou can also use commands:\n- `/summarize <text to summarize>`\n- `/flatten <JSON object>`\n- `/play <text to speak on server>`",
             "timestamp": datetime.now().isoformat(),
             "client_id": client_id
@@ -51,28 +48,31 @@ class ChatbotWebSocketServer:
         await websocket.send(json.dumps(welcome_message))
         logger.info(f"New client connected. Total clients: {len(self.clients)}")
         return client_id
-    
+
     async def unregister_client(self, websocket: WebSocketServerProtocol, client_id: str):
         self.clients.discard(websocket)
         if client_id in self.conversation_history:
             del self.conversation_history[client_id]
         logger.info(f"Client disconnected. Total clients: {len(self.clients)}")
-    
+
     async def handle_message(self, websocket: WebSocketServerProtocol, message: str, client_id: str):
         try:
             data = json.loads(message)
             message_type = data.get('type', 'message')
-            if message_type == 'message':
+
+            # --- MODIFICATION START ---
+            # Handle both standard text messages and legacy voice messages by routing them to the chat handler.
+            if message_type == 'message' or message_type == 'voice_message':
+                if message_type == 'voice_message':
+                    # Log a warning to encourage client-side updates, but still process the message.
+                    logger.warning("Received a legacy 'voice_message' type. Please update client to use 'audio_upload'.")
                 await self.handle_chat_message(websocket, data, client_id)
+            # --- MODIFICATION END ---
+
             elif message_type == 'voice_request':
                 await self.handle_voice_request(websocket, data, client_id)
-            # --- NEW: Handler for direct audio upload ---
             elif message_type == 'audio_upload':
                 await self.handle_audio_upload(websocket, data, client_id)
-            # Note: 'voice_message' is now handled by 'audio_upload'
-            # If clients still send 'voice_message', you could route it here:
-            # elif message_type == 'voice_message':
-            #     await self.handle_legacy_voice_message(websocket, data, client_id)
             else:
                 logger.warning(f"Unknown message type: {message_type}")
         except json.JSONDecodeError:
@@ -82,26 +82,26 @@ class ChatbotWebSocketServer:
             logger.error(f"Error handling message: {e}")
             error_message = {"type": "error", "message": "An error occurred while processing your message", "timestamp": datetime.now().isoformat()}
             await websocket.send(json.dumps(error_message))
-    
+
     async def handle_chat_message(self, websocket: WebSocketServerProtocol, data: dict, client_id: str):
         user_message = data.get('message', '').strip()
         if not user_message:
             return
 
         start_time = time.time()
-        
+
         if user_message.lower().startswith('/summarize '):
             text_to_summarize = user_message[11:].strip()
             if not text_to_summarize:
                 response = {"type": "assistant", "message": "Please provide text to summarize. Usage: /summarize <text>", "timestamp": datetime.now().isoformat()}
                 await websocket.send(json.dumps(response))
                 return
-            
+
             thinking_msg = {"type": "assistant", "message": "Analyzing your text...", "timestamp": datetime.now().isoformat()}
             await websocket.send(json.dumps(thinking_msg))
 
             summary_result = await self.ai_client.smart_summarize(text_to_summarize)
-            
+
             if summary_result:
                 response_text = (
                     f"**📝 Smart Summary Report**\n\n"
@@ -111,7 +111,7 @@ class ChatbotWebSocketServer:
                 )
             else:
                 response_text = "Sorry, I couldn't generate a summary. Please try again."
-            
+
             response_time = (time.time() - start_time) * 1000
             response_message = {"type": "assistant", "message": response_text, "timestamp": datetime.now().isoformat(), "response_time_ms": round(response_time, 2)}
             await websocket.send(json.dumps(response_message))
@@ -122,7 +122,7 @@ class ChatbotWebSocketServer:
                 response = {"type": "assistant", "message": "Please provide a JSON object. Usage: /flatten <json>", "timestamp": datetime.now().isoformat()}
                 await websocket.send(json.dumps(response))
                 return
-            
+
             try:
                 json_data = json.loads(json_string)
                 if not isinstance(json_data, dict):
@@ -147,7 +147,6 @@ class ChatbotWebSocketServer:
             response_message = {"type": "assistant", "message": response_text, "timestamp": datetime.now().isoformat(), "response_time_ms": round(response_time, 2)}
             await websocket.send(json.dumps(response_message))
 
-        # --- NEW: Handler for /play command ---
         elif user_message.lower().startswith('/play '):
             text_to_play = user_message[6:].strip()
             if not text_to_play:
@@ -157,7 +156,7 @@ class ChatbotWebSocketServer:
 
             response = {"type": "assistant", "message": f"Generating audio for '{text_to_play[:30]}...' to play on the server.", "timestamp": datetime.now().isoformat()}
             await websocket.send(json.dumps(response))
-            
+
             audio_data = await self.voice_service.generate_speech(text_to_play)
             if audio_data:
                 played = self.playback_service.play_audio_server_side(audio_data)
@@ -187,7 +186,6 @@ class ChatbotWebSocketServer:
             })
             logger.info(f"Processed message from client {client_id[:8]}... in {response_time:.2f}ms")
 
-    # --- NEW: Handler for direct audio upload with STT and confidence check ---
     async def handle_audio_upload(self, websocket: WebSocketServerProtocol, data: dict, client_id: str):
         try:
             audio_b64 = data.get('audio_data')
@@ -196,7 +194,6 @@ class ChatbotWebSocketServer:
                 await websocket.send(json.dumps({"type": "error", "message": "No audio data provided."}))
                 return
 
-            # Let the client know we're processing
             await websocket.send(json.dumps({"type": "system", "message": "Transcribing audio..."}))
 
             audio_data = base64.b64decode(audio_b64)
@@ -205,7 +202,6 @@ class ChatbotWebSocketServer:
             confidence = stt_result.get("confidence", 0.0)
             user_message = stt_result.get("cleaned_text", "")
 
-            # Edge Case: Confidence check
             if confidence < 0.7:
                 error_msg = f"Sorry, I couldn't understand that clearly (confidence: {confidence:.2f}). Could you please try again?"
                 await websocket.send(json.dumps({"type": "error", "message": error_msg}))
@@ -221,10 +217,9 @@ class ChatbotWebSocketServer:
             if not user_message:
                 await websocket.send(json.dumps({"type": "error", "message": "Could not detect any speech in the audio."}))
                 return
-            
-            # Send transcribed text to client for confirmation
+
             await websocket.send(json.dumps({"type": "user_transcript", "message": user_message}))
-            
+
             start_time = time.time()
             conversation_history = self.conversation_history.get(client_id, [])
             ai_response = await self.ai_client.generate_response(user_message, conversation_history)
@@ -233,30 +228,27 @@ class ChatbotWebSocketServer:
             conversation_entry = {'user': user_message, 'assistant': ai_response, 'timestamp': datetime.now().isoformat()}
             conversation_history.append(conversation_entry)
             self.conversation_history[client_id] = conversation_history
-            
-            # Send text response first, then generate and send audio
+
             response_message = {"type": "assistant", "message": ai_response, "timestamp": datetime.now().isoformat()}
             await websocket.send(json.dumps(response_message))
 
-            # Now generate and send the audio response
-            await self.handle_voice_request(websocket, {"text": ai_response, "voice": "Kore"}, client_id)
-            
+            await self.handle_voice_request(websocket, {"text": ai_response, "voice": "Nova"}, client_id)
+
             await self.chat_logger.log_chat({
                 'timestamp': datetime.now().isoformat(), 'session_id': client_id, 'message_type': 'audio_upload',
                 'user_message': user_message, 'assistant_response': ai_response, 'response_time_ms': round(response_time, 2),
                 'user_ip': websocket.remote_address[0] if websocket.remote_address else 'unknown', 'message_length': len(user_message),
-                'voice_generated': True, 'voice_voice_name': 'Kore', 'error_message': '',
+                'voice_generated': True, 'voice_voice_name': 'Nova', 'error_message': '',
                 'audio_filename': filename, 'client_agent': data.get('client_agent', 'unknown'), 'processing_status': 'success'
             })
         except Exception as e:
             logger.error(f"Error handling audio upload: {e}")
             await websocket.send(json.dumps({"type": "error", "message": "An error occurred while processing your audio."}))
 
-
     async def handle_voice_request(self, websocket: WebSocketServerProtocol, data: dict, client_id: str):
         try:
             text = data.get('text', '').strip()
-            voice_name = data.get('voice', 'Kore')
+            voice_name = data.get('voice', 'Nova')
             if not text:
                 await websocket.send(json.dumps({"type": "error", "message": "No text provided for voice generation", "timestamp": datetime.now().isoformat()}))
                 return
@@ -265,7 +257,6 @@ class ChatbotWebSocketServer:
                 audio_base64 = base64.b64encode(audio_data).decode('utf-8')
                 await websocket.send(json.dumps({"type": "voice_response", "audio_data": audio_base64, "text": text, "voice": voice_name, "timestamp": datetime.now().isoformat()}))
                 logger.info(f"Generated voice for client {client_id[:8]}... text: {text[:50]}...")
-                # Logging is now handled by the calling function (e.g., handle_audio_upload) to avoid duplicates
             else:
                 await websocket.send(json.dumps({"type": "error", "message": "Failed to generate voice", "timestamp": datetime.now().isoformat()}))
                 await self.chat_logger.log_chat({
@@ -279,14 +270,6 @@ class ChatbotWebSocketServer:
             logger.error(f"Error handling voice request: {e}")
             await websocket.send(json.dumps({"type": "error", "message": "An error occurred while generating voice", "timestamp": datetime.now().isoformat()}))
 
-    # This function is now deprecated in favor of handle_audio_upload
-    async def handle_voice_message(self, websocket: WebSocketServerProtocol, data: dict, client_id: str):
-        logger.warning("Received a legacy 'voice_message' type. Please update client to use 'audio_upload'.")
-        # For backward compatibility, you can route this to the new handler
-        # by assuming the 'message' is the audio data, but this is not recommended.
-        # For now, we just log a warning.
-        await websocket.send(json.dumps({"type": "error", "message": "This voice message format is deprecated."}))
-    
     async def handle_client(self, websocket: WebSocketServerProtocol):
         client_id = None
         try:
@@ -308,7 +291,6 @@ class ChatbotWebSocketServer:
         logger.info(f"Gemini client ready: {self.ai_client.is_ready()}")
         await server.wait_closed()
 
-# The CombinedServer and main function remain unchanged...
 class CombinedServer:
     def __init__(self):
         self.websocket_server = ChatbotWebSocketServer()
@@ -326,21 +308,21 @@ class CombinedServer:
         self.app.router.add_get('/logs/summary', self.get_log_summary)
         self.app.router.add_post('/logs/clear', self.clear_logs)
         self.app.router.add_get('/logs/export', self.export_logs_csv)
-    
+
     async def serve_index(self, request):
         index_path = Path(__file__).parent / 'static' / 'index.html'
         if index_path.exists():
             return web.FileResponse(index_path)
         else:
             return web.Response(text="Index file not found", status=404)
-    
+
     async def health_check(self, request):
         return web.json_response({
             "status": "healthy",
             "service": "AI Voice Bot",
             "websocket_ready": self.websocket_server.ai_client.is_ready()
         })
-    
+
     async def serve_logs(self, request):
         logs_html = """
         <!DOCTYPE html>
@@ -462,7 +444,7 @@ class CombinedServer:
         </html>
         """
         return web.Response(text=logs_html, content_type='text/html')
-    
+
     async def get_recent_logs(self, request):
         try:
             logs = await self.websocket_server.chat_logger.get_recent_logs(100)
@@ -470,7 +452,7 @@ class CombinedServer:
         except Exception as e:
             logger.error(f"Error getting recent logs: {e}")
             return web.json_response([], status=500)
-    
+
     async def get_log_summary(self, request):
         try:
             summary = await self.websocket_server.chat_logger.get_log_summary()
@@ -478,7 +460,7 @@ class CombinedServer:
         except Exception as e:
             logger.error(f"Error getting log summary: {e}")
             return web.json_response({}, status=500)
-    
+
     async def clear_logs(self, request):
         try:
             log_file = self.websocket_server.chat_logger.get_log_file_path()
@@ -490,7 +472,7 @@ class CombinedServer:
         except Exception as e:
             logger.error(f"Error clearing logs: {e}")
             return web.json_response({"status": "error", "message": str(e)}, status=500)
-    
+
     async def export_logs_csv(self, request):
         try:
             log_file_path = self.websocket_server.chat_logger.get_log_file_path()
@@ -501,7 +483,7 @@ class CombinedServer:
         except Exception as e:
             logger.error(f"Error exporting logs: {e}")
             return web.json_response({"status": "error", "message": str(e)}, status=500)
-    
+
     async def start_servers(self, http_port=8000, ws_port=8765, ws_host='localhost'):
         websocket_task = asyncio.create_task(self.websocket_server.start_server(ws_host, ws_port))
         runner = web.AppRunner(self.app)
@@ -523,7 +505,7 @@ async def main():
     parser.add_argument('--host', default='localhost', help='WebSocket host (default: localhost)')
     parser.add_argument('--http-port', type=int, default=8000, help='HTTP port (default: 8000)')
     parser.add_argument('--demo', action='store_true', help='Run in demo mode without Gemini API')
-    
+
     args = parser.parse_args()
 
     print("---")
@@ -533,7 +515,7 @@ async def main():
     print(f"HTTP Server: http://{args.host}:{args.http_port}")
     print(f"Log File: {Config.LOG_FILE}")
     print(f"AI Service: Google Gemini AI")
-    
+
     if not args.demo and not Config.GEMINI_API_KEY:
         print("❌ Gemini API key not configured!")
         print("💡 Please update GEMINI_API_KEY in the .env file.")
@@ -544,7 +526,7 @@ async def main():
     print(f"   http://{args.host}:{args.http_port}")
     print("⏹️ Press Ctrl+C to stop the server")
     print("=" * 60)
-    
+
     server = CombinedServer()
     await server.start_servers(http_port=args.http_port, ws_port=args.port, ws_host=args.host)
 
