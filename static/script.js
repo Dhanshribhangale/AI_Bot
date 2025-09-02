@@ -10,191 +10,42 @@ const voiceStatus = document.getElementById('voice-status');
 let ws;
 let isVoiceEnabled = false;
 let sessionId = null;
-const audioQueue = [];
-let isPlaying = false;
 
 // Speech Recognition setup
 let recognition = null;
 let isRecording = false;
 
-// Initialize speech recognition if available
-function initSpeechRecognition() {
-    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        recognition = new SpeechRecognition();
-        
-        recognition.continuous = false;
-        recognition.interimResults = true;
-        recognition.lang = 'en-US';
-        
-        recognition.onstart = () => {
-            isRecording = true;
-            voiceInputBtn.classList.add('recording');
-            voiceInputBtn.textContent = '⏹️';
-            voiceStatus.textContent = 'Listening...';
-            voiceStatus.className = 'voice-status recording';
-            statusDiv.textContent = 'Voice input active...';
-        };
-        
-        recognition.onresult = (event) => {
-            let finalTranscript = '';
-            let interimTranscript = '';
-            
-            for (let i = event.resultIndex; i < event.results.length; i++) {
-                const transcript = event.results[i][0].transcript;
-                if (event.results[i].isFinal) {
-                    finalTranscript += transcript;
-                } else {
-                    interimTranscript += transcript;
-                }
-            }
-            
-            // Show interim results
-            if (interimTranscript) {
-                userInput.value = interimTranscript;
-            }
-            
-            // Process final result
-            if (finalTranscript) {
-                userInput.value = finalTranscript;
-                voiceStatus.textContent = 'Processing voice input...';
-                voiceStatus.className = 'voice-status success';
-                
-                // Automatically send the voice input
-                setTimeout(() => {
-                    sendVoiceMessage(finalTranscript);
-                }, 500);
-            }
-        };
-        
-        recognition.onerror = (event) => {
-            console.error('Speech recognition error:', event.error);
-            isRecording = false;
-            voiceInputBtn.classList.remove('recording');
-            voiceInputBtn.textContent = '🎤';
-            voiceStatus.textContent = `Error: ${event.error}`;
-            voiceStatus.className = 'voice-status error';
-            statusDiv.textContent = 'Voice input error. Please try again.';
-        };
-        
-        recognition.onend = () => {
-            isRecording = false;
-            voiceInputBtn.classList.remove('recording');
-            voiceInputBtn.textContent = '🎤';
-            if (voiceStatus.textContent === 'Listening...') {
-                voiceStatus.textContent = 'Voice input ended';
-                voiceStatus.className = 'voice-status';
-            }
-            statusDiv.textContent = 'Ready to chat.';
-        };
-        
-        console.log('Speech recognition initialized');
-    } else {
-        console.warn('Speech recognition not supported in this browser');
-        voiceInputBtn.style.display = 'none';
-        voiceStatus.textContent = 'Voice input not supported in this browser';
-        voiceStatus.className = 'voice-status error';
-    }
-}
-
-// Add event listeners for voice functionality
-voiceBtn.addEventListener('click', toggleVoice);
-voiceSelect.addEventListener('change', onVoiceChange);
-voiceInputBtn.addEventListener('click', toggleVoiceInput);
-
-// Voice input toggle function
-function toggleVoiceInput() {
-    if (!recognition) {
-        voiceStatus.textContent = 'Speech recognition not available';
-        voiceStatus.className = 'voice-status error';
-        return;
-    }
-    
-    if (isRecording) {
-        recognition.stop();
-    } else {
-        try {
-            recognition.start();
-        } catch (error) {
-            console.error('Error starting speech recognition:', error);
-            voiceStatus.textContent = 'Error starting voice input';
-            voiceStatus.className = 'voice-status error';
-        }
-    }
-}
-
-// Function to send voice message
-function sendVoiceMessage(transcript) {
-    if (!transcript.trim()) return;
-    
-    // Display user message
-    addMessage('user', transcript);
-    statusDiv.textContent = 'Processing voice input...';
-    
-    // Send message to server
-    if (ws.readyState === WebSocket.OPEN) {
-        const payload = {
-            type: 'voice_message',
-            message: transcript,
-            client_agent: navigator.userAgent
-        };
-        ws.send(JSON.stringify(payload));
-        userInput.value = '';
-        
-        // Automatically enable voice output for voice input
-        if (!isVoiceEnabled) {
-            isVoiceEnabled = true;
-            voiceBtn.textContent = '🔇 Disable Voice';
-            voiceBtn.classList.add('active');
-        }
-    } else {
-        addMessage('system', 'Connection not open. Please wait.');
-    }
-}
-
+// --- WebSocket Connection Setup ---
 function connectWebSocket() {
-    ws = new WebSocket(`ws://${location.hostname}:8765`);
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    // Use your actual WebSocket host and port
+    ws = new WebSocket(`${wsProtocol}//${window.location.hostname}:8765`);
 
     ws.onopen = () => {
-        statusDiv.textContent = 'Connected. Waiting for AI...';
+        statusDiv.textContent = 'Connected to AI Voice Bot';
         console.log('WebSocket connected');
     };
 
-    ws.onmessage = async (event) => {
+    ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
         console.log('Message received:', data);
 
         if (data.type === 'system' && data.client_id) {
             sessionId = data.client_id;
             addMessage('assistant', data.message);
-            statusDiv.textContent = 'Ready to chat.';
-        } else if (data.type === 'assistant') {
-            addMessage('assistant', data.message);
-            if (isVoiceEnabled) {
-                // Request voice for the assistant's message
-                requestVoice(data.message);
+        } else if (data.type === 'assistant' || data.type === 'voice_message_response') {
+            const messageElement = addMessage('assistant', data.message, false, data.response_time_ms);
+            // If voice is on, request audio for this new message
+            if (isVoiceEnabled || data.type === 'voice_message_response') {
+                requestVoice(data.message, messageElement.id);
             }
-            statusDiv.textContent = 'Ready to chat.';
         } else if (data.type === 'voice_response') {
-            const audioData = data.audio_data;
-            if (audioData) {
-                const audioBlob = base64toBlob(audioData, 'audio/wav');
-                const audioUrl = URL.createObjectURL(audioBlob);
-                await playAudio(audioUrl);
-            }
-        } else if (data.type === 'voice_message_response') {
-            // Handle response to voice input - automatically enable voice output
-            addMessage('assistant', data.message);
-            isVoiceEnabled = true;
-            voiceBtn.textContent = '🔇 Disable Voice';
-            voiceBtn.classList.add('active');
-            
-            // Always generate voice for voice input responses
-            requestVoice(data.message);
-            statusDiv.textContent = 'Ready to chat.';
+            // Audio is ready, add the play and download buttons
+            addAudioButtonsToMessage(data.audio_data, data.messageId);
+        } else if (data.type === 'user_transcript') {
+             addMessage('user', data.message, true);
         } else if (data.type === 'error') {
             addMessage('system', `Error: ${data.message}`);
-            statusDiv.textContent = 'An error occurred.';
         }
     };
 
@@ -206,168 +57,131 @@ function connectWebSocket() {
 
     ws.onerror = (error) => {
         console.error('WebSocket error:', error);
-        statusDiv.textContent = 'Connection error. Check console for details.';
+        statusDiv.textContent = 'Connection error. Check console.';
     };
 }
 
-function addMessage(sender, message) {
+// --- Message Display and Handling ---
+function addMessage(sender, message, isUser = false, responseTime = null) {
+    const messageId = `msg-${Date.now()}-${Math.random()}`;
     const messageDiv = document.createElement('div');
     messageDiv.classList.add('message', sender);
+    messageDiv.id = messageId;
 
-    // Sanitize text before inserting as HTML to prevent XSS
-    const escapeHtml = (unsafe) => {
-        return unsafe
-             .replace(/&/g, "&amp;")
-             .replace(/</g, "&lt;")
-             .replace(/>/g, "&gt;")
-             .replace(/"/g, "&quot;")
-             .replace(/'/g, "&#039;");
-    };
+    const contentDiv = document.createElement('div');
+    contentDiv.classList.add('message-content');
 
-    if (sender === 'assistant' || sender === 'system') {
-        let formattedMessage = escapeHtml(message);
-        formattedMessage = formattedMessage.replace(/\n/g, '<br>');
-        formattedMessage = formattedMessage.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
-        formattedMessage = formattedMessage.replace(/```json\n([\s\S]*?)\n```/g, (match, p1) => `<pre><code>${p1.trim()}</code></pre>`);
-        formattedMessage = formattedMessage.replace(/```([\s\S]*?)```/g, (match, p1) => `<pre><code>${p1.trim()}</code></pre>`);
-        messageDiv.innerHTML = formattedMessage;
-    } else {
-        messageDiv.textContent = message;
+    const p = document.createElement('p');
+    // Basic markdown and HTML safety
+    let formattedMessage = message.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    formattedMessage = formattedMessage.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
+    p.innerHTML = formattedMessage;
+    contentDiv.appendChild(p);
+
+    if (sender === 'assistant') {
+        const audioBtnContainer = document.createElement('div');
+        audioBtnContainer.classList.add('audio-btn-container');
+        contentDiv.appendChild(audioBtnContainer);
     }
+    
+    messageDiv.appendChild(contentDiv);
+
+    const timestampDiv = document.createElement('div');
+    timestampDiv.classList.add('timestamp');
+    timestampDiv.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    if (responseTime) {
+        const responseTimeSpan = document.createElement('span');
+        responseTimeSpan.classList.add('response-time');
+        responseTimeSpan.textContent = ` (${responseTime}ms)`;
+        timestampDiv.appendChild(responseTimeSpan);
+    }
+    
+    messageDiv.appendChild(timestampDiv);
     
     chatMessages.appendChild(messageDiv);
     chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    return messageDiv; // Return the element so we can get its ID
 }
 
 function sendMessage() {
     const message = userInput.value.trim();
-    if (message === '') return;
+    if (message === '' || ws.readyState !== WebSocket.OPEN) return;
 
-    // Display user message
-    addMessage('user', message);
-    statusDiv.textContent = 'Thinking...';
-
-    // Send message to server
-    if (ws.readyState === WebSocket.OPEN) {
-        const payload = {
-            type: 'message',
-            message: message,
-            client_agent: navigator.userAgent
-        };
-        ws.send(JSON.stringify(payload));
-        userInput.value = '';
-    } else {
-        addMessage('system', 'Connection not open. Please wait.');
-    }
+    addMessage('user', message, true);
+    
+    const payload = {
+        type: 'message',
+        message: message,
+        client_agent: navigator.userAgent
+    };
+    ws.send(JSON.stringify(payload));
+    userInput.value = '';
 }
 
-function requestVoice(text) {
+// --- Voice Generation and Playback ---
+function requestVoice(text, messageId) {
     if (ws.readyState === WebSocket.OPEN) {
         const payload = {
             type: 'voice_request',
             text: text,
             voice: voiceSelect.value,
-            client_agent: navigator.userAgent
+            messageId: messageId
         };
         ws.send(JSON.stringify(payload));
-        statusDiv.textContent = 'Generating voice...';
-    } else {
-        addMessage('system', 'Connection not open. Please wait.');
     }
 }
 
-// Voice toggle functionality
-function toggleVoice() {
-    isVoiceEnabled = !isVoiceEnabled;
-    if (isVoiceEnabled) {
-        voiceBtn.textContent = '🔇 Disable Voice';
-        voiceBtn.classList.add('active');
-        statusDiv.textContent = 'Voice enabled. AI responses will be spoken.';
-    } else {
-        voiceBtn.textContent = '🔊 Enable Voice';
-        voiceBtn.classList.remove('active');
-        statusDiv.textContent = 'Voice disabled.';
-        // Stop any currently playing audio
-        stopAllAudio();
-    }
-}
-
-// Handle voice selection change
-function onVoiceChange() {
-    const selectedVoice = voiceSelect.value;
-    statusDiv.textContent = `Voice changed to: ${selectedVoice}`;
-    console.log(`Voice changed to: ${selectedVoice}`);
-}
-
-// Audio queue management
-function addToAudioQueue(audioUrl) {
-    audioQueue.push(audioUrl);
-    if (!isPlaying) {
-        playNextInQueue();
-    }
-}
-
-async function playNextInQueue() {
-    if (audioQueue.length === 0) {
-        isPlaying = false;
+function addAudioButtonsToMessage(audioData, messageId) {
+    if (!messageId) {
+        console.error("Cannot add audio buttons: messageId is missing.");
         return;
     }
-    
-    isPlaying = true;
-    const audioUrl = audioQueue.shift();
-    await playAudio(audioUrl);
-    playNextInQueue();
+    const messageDiv = document.getElementById(messageId);
+    if (!messageDiv) {
+        console.error(`Element with ID ${messageId} not found.`);
+        return;
+    }
+
+    const audioBtnContainer = messageDiv.querySelector('.audio-btn-container');
+    if (audioBtnContainer) {
+        // Create Play Button
+        const playBtn = document.createElement('button');
+        playBtn.className = 'play-audio-btn';
+        playBtn.innerHTML = '▶️';
+        playBtn.title = 'Play Audio';
+        playBtn.onclick = () => {
+            const audioBlob = base64toBlob(audioData, 'audio/wav');
+            const audioUrl = URL.createObjectURL(audioBlob);
+            const audio = new Audio(audioUrl);
+            audio.play().catch(e => console.error("Audio play failed:", e));
+        };
+
+        // Create Download Button
+        const downloadBtn = document.createElement('button');
+        downloadBtn.className = 'download-audio-btn';
+        downloadBtn.innerHTML = '💾'; // Save icon
+        downloadBtn.title = 'Download Audio';
+        downloadBtn.onclick = () => {
+            const audioBlob = base64toBlob(audioData, 'audio/wav');
+            const audioUrl = URL.createObjectURL(audioBlob);
+            const link = document.createElement('a');
+            link.href = audioUrl;
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            link.download = `bot-response-${timestamp}.wav`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(audioUrl);
+        };
+        
+        audioBtnContainer.innerHTML = ''; // Clear any placeholders
+        audioBtnContainer.appendChild(playBtn);
+        audioBtnContainer.appendChild(downloadBtn);
+    }
 }
 
-// Stop all audio playback
-function stopAllAudio() {
-    // Clear the audio queue
-    audioQueue.length = 0;
-    isPlaying = false;
-    
-    // Stop any currently playing audio elements
-    const audioElements = document.querySelectorAll('audio');
-    audioElements.forEach(audio => {
-        audio.pause();
-        audio.currentTime = 0;
-    });
-}
-
-async function playAudio(url) {
-    return new Promise((resolve, reject) => {
-        const audio = new Audio(url);
-        
-        audio.onloadstart = () => {
-            statusDiv.textContent = 'Playing audio...';
-        };
-        
-        audio.oncanplay = () => {
-            statusDiv.textContent = 'Audio ready to play.';
-        };
-        
-        audio.onended = () => {
-            statusDiv.textContent = 'Ready to chat.';
-            URL.revokeObjectURL(url);
-            resolve();
-        };
-        
-        audio.onerror = (error) => {
-            console.error('Audio playback error:', error);
-            statusDiv.textContent = 'Audio playback error.';
-            URL.revokeObjectURL(url);
-            reject(error);
-        };
-        
-        audio.play().catch(error => {
-            console.error('Failed to play audio:', error);
-            statusDiv.textContent = 'Failed to play audio.';
-            URL.revokeObjectURL(url);
-            reject(error);
-        });
-    });
-}
-
-// Convert base64 to blob
 function base64toBlob(base64Data, mimeType) {
     const byteCharacters = atob(base64Data);
     const byteNumbers = new Array(byteCharacters.length);
@@ -378,14 +192,88 @@ function base64toBlob(base64Data, mimeType) {
     return new Blob([byteArray], { type: mimeType });
 }
 
-// Event listeners
+// --- UI Controls and Speech Recognition ---
+function toggleVoice() {
+    isVoiceEnabled = !isVoiceEnabled;
+    voiceBtn.textContent = isVoiceEnabled ? '🔇 Disable Voice' : '🔊 Enable Voice';
+    voiceBtn.classList.toggle('active', isVoiceEnabled);
+}
+
+function onVoiceChange() {
+    statusDiv.textContent = `Voice changed to: ${voiceSelect.value}`;
+}
+
+function initSpeechRecognition() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+        voiceInputBtn.style.display = 'none';
+        console.warn('Speech recognition not supported.');
+        return;
+    }
+
+    recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'en-US';
+
+    recognition.onstart = () => {
+        isRecording = true;
+        voiceInputBtn.classList.add('recording');
+        voiceInputBtn.textContent = '⏹️';
+    };
+
+    recognition.onresult = (event) => {
+        const transcript = event.results[0][0].transcript;
+        sendVoiceMessage(transcript);
+    };
+
+    recognition.onerror = (event) => {
+        console.error('Speech recognition error:', event.error);
+    };
+
+    recognition.onend = () => {
+        isRecording = false;
+        voiceInputBtn.classList.remove('recording');
+        voiceInputBtn.textContent = '🎤';
+    };
+}
+
+function toggleVoiceInput() {
+    if (!recognition) return;
+    if (isRecording) {
+        recognition.stop();
+    } else {
+        recognition.start();
+    }
+}
+
+function sendVoiceMessage(transcript) {
+    if (!transcript.trim()) return;
+    
+    addMessage('user', transcript, true);
+    
+    if (ws.readyState === WebSocket.OPEN) {
+        const payload = {
+            type: 'voice_message',
+            message: transcript,
+            client_agent: navigator.userAgent
+        };
+        ws.send(JSON.stringify(payload));
+        userInput.value = '';
+    }
+}
+
+// --- Event Listeners and Initialization ---
 sendBtn.addEventListener('click', sendMessage);
 userInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') {
-        sendMessage();
-    }
+    if (e.key === 'Enter') sendMessage();
 });
 
-// Initialize
+voiceBtn.addEventListener('click', toggleVoice);
+voiceSelect.addEventListener('change', onVoiceChange);
+voiceInputBtn.addEventListener('click', toggleVoiceInput);
+
+// Initialize the application
 connectWebSocket();
-initSpeechRecognition(); // Initialize speech recognition
+initSpeechRecognition();
+
